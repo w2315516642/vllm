@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import NamedTuple
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -15,6 +18,8 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -28,6 +33,20 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class SegmentedRecomputePlan:
+    """Missing head and cache-resident suffix used by two-phase recompute."""
+
+    repair_end: int
+    resume_at: int
+    pinned_blocks: list[KVCacheBlock]
+    ready_for_lookup: bool = False
+
+    @property
+    def skipped_tokens(self) -> int:
+        return self.resume_at - self.repair_end
 
 
 def _validate_prefix_cache_retention_interval(
@@ -332,8 +351,11 @@ class KVCacheCoordinator(ABC):
         Args:
             request_id: The request ID.
         """
-        for manager in self.single_type_managers:
-            manager.free(request_id)
+        if envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE:
+            self.block_pool.free_blocks(self.pop_blocks_in_eviction_order(request_id))
+        else:
+            for manager in self.single_type_managers:
+                manager.free(request_id)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
@@ -352,6 +374,13 @@ class KVCacheCoordinator(ABC):
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))
+        return blocks
+
+    def pop_blocks_in_eviction_order(self, request_id: str) -> list[KVCacheBlock]:
+        """Pop blocks in the order they should enter the free queue."""
+        blocks: list[KVCacheBlock] = []
+        for manager in self.single_type_managers:
+            blocks.extend(reversed(manager.pop_blocks_for_free(request_id)))
         return blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
@@ -943,6 +972,147 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 hit_lengths[gid] = group_hit
 
         return tuple(hit_blocks), tuple(hit_lengths)
+
+    def pop_blocks_in_eviction_order(self, request_id: str) -> list[KVCacheBlock]:
+        """Place FA segments ahead of the checkpoint needed to replay them."""
+        fallback: list[KVCacheBlock] = []
+        full_attention: list[tuple[int, KVCacheBlock]] = []
+        checkpoints: dict[int, list[tuple[int, KVCacheBlock]]] = {}
+        mamba_manager_count = 0
+
+        for manager_index, manager in enumerate(self.single_type_managers):
+            if (
+                isinstance(manager, MambaManager)
+                and manager.mamba_cache_mode == "align"
+            ):
+                mamba_manager_count += 1
+                manager_blocks, manager_checkpoints = (
+                    manager.pop_blocks_and_checkpoints(request_id)
+                )
+                fallback.extend(manager_blocks)
+                for boundary, block in manager_checkpoints:
+                    checkpoints.setdefault(boundary, []).append((manager_index, block))
+            elif isinstance(manager, FullAttentionManager):
+                full_attention.extend(
+                    ((index + 1) * manager.block_size, block)
+                    for index, block in enumerate(
+                        manager.pop_blocks_for_free(request_id)
+                    )
+                )
+            else:
+                fallback.extend(reversed(manager.pop_blocks_for_free(request_id)))
+
+        complete_boundaries = sorted(
+            boundary
+            for boundary, blocks in checkpoints.items()
+            if len({manager_index for manager_index, _ in blocks})
+            == mamba_manager_count
+        )
+        incomplete = set(checkpoints).difference(complete_boundaries)
+        fallback.extend(
+            block
+            for boundary in incomplete
+            for _, block in reversed(checkpoints[boundary])
+        )
+        if not full_attention or not complete_boundaries:
+            fallback.extend(block for _, block in reversed(full_attention))
+            fallback.extend(
+                block
+                for boundary in reversed(complete_boundaries)
+                for _, block in checkpoints[boundary]
+            )
+            return fallback
+
+        full_attention.sort(key=lambda item: item[0])
+        segments: list[list[KVCacheBlock]] = [
+            [] for _ in range(len(complete_boundaries) + 1)
+        ]
+        for end_tokens, block in full_attention:
+            segments[bisect_left(complete_boundaries, end_tokens)].append(block)
+
+        ordered = fallback + segments[-1]
+        for index in range(len(complete_boundaries) - 1, -1, -1):
+            boundary = complete_boundaries[index]
+            ordered.extend(segments[index])
+            ordered.extend(block for _, block in checkpoints[boundary])
+        return ordered
+
+    def find_segmented_recompute_plan(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> SegmentedRecomputePlan | None:
+        """Find a missing head followed by a reusable FA/GDN suffix."""
+        if len(self.attention_groups) != 2:
+            return None
+        full_group, mamba_group = self.attention_groups
+        if not isinstance(full_group.spec, FullAttentionSpec) or not isinstance(
+            mamba_group.spec, MambaSpec
+        ):
+            return None
+        if mamba_group.spec.mamba_cache_mode != "align":
+            return None
+
+        mamba_manager = self.single_type_managers[mamba_group.group_ids[0]]
+        mamba_blocks, resume_at = mamba_group.manager_cls.find_longest_cache_hit(
+            block_hashes=block_hashes,
+            max_length=max_cache_hit_length,
+            kv_cache_group_ids=mamba_group.group_ids,
+            block_pool=self.block_pool,
+            kv_cache_spec=mamba_group.spec,
+            drop_eagle_block=False,
+            alignment_tokens=self._cache_hit_alignment_tokens,
+            dcp_world_size=mamba_manager.dcp_world_size,
+            pcp_world_size=mamba_manager.pcp_world_size,
+        )
+        if resume_at <= 0:
+            return None
+
+        full_manager = self.single_type_managers[full_group.group_ids[0]]
+        full_blocks, repair_end = full_group.manager_cls.find_cache_suffix_ending_at(
+            block_hashes=block_hashes,
+            end_length=resume_at,
+            kv_cache_group_ids=full_group.group_ids,
+            block_pool=self.block_pool,
+            kv_cache_spec=full_group.spec,
+            dcp_world_size=full_manager.dcp_world_size,
+            pcp_world_size=full_manager.pcp_world_size,
+        )
+        if repair_end <= 0 or repair_end >= resume_at:
+            return None
+
+        pinned = {
+            block.block_id: block
+            for group in (*full_blocks, *mamba_blocks)
+            for block in group
+            if not block.is_null
+        }
+        if not pinned:
+            return None
+        return SegmentedRecomputePlan(
+            repair_end=repair_end,
+            resume_at=resume_at,
+            pinned_blocks=list(pinned.values()),
+        )
+
+    def get_repaired_head_blocks(
+        self, request_id: str, repair_end: int, excluded_ids: set[int]
+    ) -> list[KVCacheBlock]:
+        """Return cacheable FA blocks produced by a completed head repair."""
+        blocks: list[KVCacheBlock] = []
+        for manager in self.single_type_managers:
+            if not isinstance(manager, FullAttentionManager):
+                continue
+            num_blocks = cdiv(repair_end, manager.block_size)
+            for block in manager.req_to_blocks[request_id][:num_blocks]:
+                if (
+                    not block.is_null
+                    and block.block_hash is not None
+                    and block.block_id not in excluded_ids
+                ):
+                    blocks.append(block)
+                    excluded_ids.add(block.block_id)
+        return blocks
 
 
 def get_kv_cache_coordinator(

@@ -4,8 +4,10 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import ClassVar
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -36,6 +38,14 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _MambaCheckpoint:
+    block: KVCacheBlock
+    block_hash: BlockHashWithGroupId
+    num_tokens: int
+    pinned: bool = False
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -702,6 +712,51 @@ class SingleTypeKVCacheManager(ABC):
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+
+    @classmethod
+    def find_cache_suffix_ending_at(
+        cls,
+        block_hashes: BlockHashList,
+        end_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Find the contiguous cached FA suffix ending at ``end_length``."""
+        assert isinstance(kv_cache_spec, FullAttentionSpec)
+        block_size = kv_cache_spec.block_size * dcp_world_size
+        hash_block_size = block_pool.hash_block_size
+        if end_length <= 0 or end_length % hash_block_size != 0:
+            return tuple([] for _ in kv_cache_group_ids), end_length
+        hashes = resolve_block_hashes(
+            block_hashes,
+            hash_block_size,
+            block_size,
+            supports_fine_grained_hash_lookup=True,
+            alignment_tokens=hash_block_size,
+        )
+        assert isinstance(hashes, Sequence)
+        num_blocks = min(
+            cdiv(end_length, block_size),
+            cdiv(len(hashes) * hash_block_size, block_size),
+        )
+        reversed_blocks = tuple([] for _ in kv_cache_group_ids)
+        first_block_idx = num_blocks
+        for block_idx in range(num_blocks - 1, -1, -1):
+            block_end = min(end_length, (block_idx + 1) * block_size)
+            cached = block_pool.get_cached_block(
+                hashes[block_end // hash_block_size - 1], kv_cache_group_ids
+            )
+            if cached is None:
+                break
+            for group_blocks, block in zip(reversed_blocks, cached):
+                group_blocks.append(block)
+            first_block_idx = block_idx
+        for group_blocks in reversed_blocks:
+            group_blocks.reverse()
+        return reversed_blocks, first_block_idx * block_size
 
     @classmethod
     def find_longest_cache_hit(
@@ -1414,6 +1469,103 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            self._latest_checkpoint_by_request: dict[str, _MambaCheckpoint] = {}
+            self._retained_checkpoints_by_request: dict[
+                str, dict[int, _MambaCheckpoint]
+            ] = {}
+
+    def _record_checkpoint(
+        self,
+        request_id: str,
+        block: KVCacheBlock,
+        block_hash: BlockHashWithGroupId | None = None,
+        num_tokens: int | None = None,
+        pin: bool = False,
+        retain: bool = False,
+    ) -> None:
+        """Track a replay checkpoint and pin only the newest running state."""
+        if (
+            not envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
+            or self.mamba_cache_mode != "align"
+            or block.is_null
+        ):
+            return
+        block_hash = block_hash or block.block_hash
+        if block_hash is None:
+            return
+        num_tokens = num_tokens or block.block_hash_num_tokens
+        if num_tokens is None:
+            return
+        if retain:
+            self._retained_checkpoints_by_request.setdefault(request_id, {})[
+                num_tokens
+            ] = _MambaCheckpoint(block, block_hash, num_tokens)
+
+        previous = self._latest_checkpoint_by_request.get(request_id)
+        if previous is not None and num_tokens < previous.num_tokens:
+            return
+        if previous is not None and previous.block is block:
+            if pin and not previous.pinned:
+                self.block_pool.touch([block])
+                previous.pinned = True
+            previous.block_hash = block_hash
+            previous.num_tokens = num_tokens
+            return
+        if previous is not None and previous.pinned:
+            self.block_pool.free_blocks([previous.block])
+        if pin:
+            self.block_pool.touch([block])
+        self._latest_checkpoint_by_request[request_id] = _MambaCheckpoint(
+            block, block_hash, num_tokens, pin
+        )
+
+    def pop_blocks_and_checkpoints(
+        self, request_id: str
+    ) -> tuple[list[KVCacheBlock], list[tuple[int, KVCacheBlock]]]:
+        """Pop request blocks and detach its cache-resident checkpoints."""
+        retained = self._retained_checkpoints_by_request.pop(request_id, {})
+        latest = self._latest_checkpoint_by_request.pop(request_id, None)
+        blocks = list(reversed(self.pop_blocks_for_free(request_id)))
+        checkpoints = dict(retained)
+        if latest is not None:
+            checkpoints[latest.num_tokens] = latest
+
+        owned_indices = {block.block_id: index for index, block in enumerate(blocks)}
+        detached_indices: set[int] = set()
+        detached_ids: set[int] = set()
+        detached: list[tuple[int, KVCacheBlock]] = []
+        for boundary, checkpoint in sorted(checkpoints.items()):
+            block = checkpoint.block
+            is_latest = checkpoint is latest
+            if block.block_id in detached_ids:
+                if is_latest and checkpoint.pinned:
+                    self.block_pool.free_blocks([block])
+                continue
+            if not self.block_pool.cached_block_hash_to_block.contain(
+                checkpoint.block_hash, block.block_id
+            ):
+                if is_latest and checkpoint.pinned:
+                    self.block_pool.free_blocks([block])
+                continue
+
+            owned_index = owned_indices.get(block.block_id)
+            if owned_index is not None:
+                if not (is_latest and checkpoint.pinned):
+                    detached_indices.add(owned_index)
+            elif not (is_latest and checkpoint.pinned):
+                if block.ref_cnt != 0:
+                    continue
+                self.block_pool.touch([block])
+            detached.append((boundary, block))
+            detached_ids.add(block.block_id)
+
+        if detached_indices:
+            blocks = [
+                block
+                for index, block in enumerate(blocks)
+                if index not in detached_indices
+            ]
+        return blocks, detached
 
     @classmethod
     def find_longest_cache_hit(
@@ -1560,6 +1712,17 @@ class MambaManager(SingleTypeKVCacheManager):
         num_prompt_tokens: int | None = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+
+        if self.mamba_cache_mode == "align":
+            last_state_block_idx = self.last_state_block_idx.get(request_id)
+            if (
+                last_state_block_idx is not None
+                and last_state_block_idx
+                < cdiv(processed_computed_tokens, self.block_size) - 1
+            ):
+                block = self.req_to_blocks[request_id][last_state_block_idx]
+                if block != self._null_block:
+                    self._record_checkpoint(request_id, block, pin=True)
 
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
@@ -1775,6 +1938,17 @@ class MambaManager(SingleTypeKVCacheManager):
                         # overwrites source_block.
                         assert req_blocks[block_idx] is source_block
                         self.block_pool.move_block_hashes(source_block, cow_block)
+                        latest = self._latest_checkpoint_by_request.get(request_id)
+                        if latest is not None and latest.block is source_block:
+                            if latest.pinned:
+                                self.block_pool.touch([cow_block])
+                                self.block_pool.free_blocks([source_block])
+                            latest.block = cow_block
+                        for checkpoint in self._retained_checkpoints_by_request.get(
+                            request_id, {}
+                        ).values():
+                            if checkpoint.block is source_block:
+                                checkpoint.block = cow_block
                         self._pending_cow_copies.append((source_block, cow_block))
                         source_block.ref_cnt += 1
                         producer_tail = self._producer_partial_tail_reqs.pop(
@@ -1840,6 +2014,10 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            self._retained_checkpoints_by_request.pop(request_id, None)
+            latest = self._latest_checkpoint_by_request.pop(request_id, None)
+            if latest is not None and latest.pinned:
+                self.block_pool.free_blocks([latest.block])
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -1884,6 +2062,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
+                self._record_checkpoint(
+                    request.request_id,
+                    block,
+                    retain=retention_interval is not None,
+                )
                 if self.mamba_cache_mode == "align":
                     # Offer every retained boundary with its exact block.
                     # The connector filters against its save window, which may
@@ -1943,6 +2126,13 @@ class MambaManager(SingleTypeKVCacheManager):
             self._producer_partial_tail_reqs[request.request_id] = (
                 source_block,
                 num_tokens,
+            )
+            self._record_checkpoint(
+                request.request_id,
+                source_block,
+                block_hash=partial_hash,
+                num_tokens=num_tokens,
+                retain=True,
             )
         return partial_hash
 

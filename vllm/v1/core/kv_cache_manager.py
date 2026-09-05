@@ -4,13 +4,16 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    SegmentedRecomputePlan,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -115,6 +118,14 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
+class SegmentedRecomputeAction(Enum):
+    """Admission action after probing for a reusable cache suffix."""
+
+    NONE = auto()
+    START = auto()
+    DEFER = auto()
+
+
 class KVCacheManager:
     def __init__(
         self,
@@ -188,6 +199,100 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self._segmented_recompute: dict[str, SegmentedRecomputePlan] = {}
+        self._segmented_recompute_attempted: set[str] = set()
+        self._segmented_recompute_deferred: set[str] = set()
+
+    def get_segmented_recompute_state(
+        self, request_id: str
+    ) -> SegmentedRecomputePlan | None:
+        return self._segmented_recompute.get(request_id)
+
+    def prepare_segmented_recompute(self, request: Request) -> SegmentedRecomputeAction:
+        """Probe once and either start, defer, or reject a head repair.
+
+        Only one request may repair at a time. This bounds pinned capacity and
+        prevents cross-request repair deadlocks.
+        """
+        if (
+            not envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
+            or not self.enable_caching
+            or request.has_encoder_inputs
+            or request.request_id in self._segmented_recompute_attempted
+            or not isinstance(self.coordinator, HybridKVCacheCoordinator)
+        ):
+            return SegmentedRecomputeAction.NONE
+        if request.request_id in self._segmented_recompute_deferred:
+            if self._segmented_recompute:
+                return SegmentedRecomputeAction.DEFER
+            self._segmented_recompute_deferred.remove(request.request_id)
+        plan = self.coordinator.find_segmented_recompute_plan(
+            request.block_hashes, request.num_tokens - 1
+        )
+        if plan is None:
+            self._segmented_recompute_attempted.add(request.request_id)
+            logger.debug(
+                "Segmented recompute candidate unavailable for %s",
+                request.request_id,
+            )
+            return SegmentedRecomputeAction.NONE
+        if self._segmented_recompute:
+            self._segmented_recompute_deferred.add(request.request_id)
+            return SegmentedRecomputeAction.DEFER
+        self._segmented_recompute_attempted.add(request.request_id)
+        self.block_pool.touch(plan.pinned_blocks)
+        self._segmented_recompute[request.request_id] = plan
+        logger.info(
+            "Segmented recompute started for %s: repair [0, %d), reuse [%d, %d)",
+            request.request_id,
+            plan.repair_end,
+            plan.repair_end,
+            plan.resume_at,
+        )
+        return SegmentedRecomputeAction.START
+
+    def complete_segmented_recompute_head(self, request: Request) -> None:
+        """Pin repaired full-attention head blocks and release repair state."""
+        state = self._segmented_recompute[request.request_id]
+        assert not state.ready_for_lookup
+        pinned_ids = {block.block_id for block in state.pinned_blocks}
+        repaired_blocks = self.coordinator.get_repaired_head_blocks(
+            request.request_id, state.repair_end, pinned_ids
+        )
+        assert repaired_blocks, "Head repair completed without cacheable head blocks"
+        self.block_pool.touch(repaired_blocks)
+        state.pinned_blocks.extend(repaired_blocks)
+        self.coordinator.free(request.request_id)
+        state.ready_for_lookup = True
+        logger.info(
+            "Segmented recompute repaired head for %s at token %d",
+            request.request_id,
+            state.repair_end,
+        )
+
+    def finish_segmented_recompute(self, request_id: str) -> int:
+        """Drop temporary pins after native prefix lookup owns all hit blocks."""
+        state = self._segmented_recompute.pop(request_id)
+        assert state.ready_for_lookup
+        self.block_pool.free_blocks(state.pinned_blocks)
+        logger.info(
+            "Segmented recompute resumed %s at token %d; skipped %d tokens",
+            request_id,
+            state.resume_at,
+            state.skipped_tokens,
+        )
+        return state.skipped_tokens
+
+    def release_segmented_recompute(
+        self, request_id: str, reset_attempt: bool = False
+    ) -> None:
+        """Release repair pins and optionally allow a later admission retry."""
+        state = self._segmented_recompute.pop(request_id, None)
+        if state is not None:
+            self.block_pool.free_blocks(state.pinned_blocks)
+        if reset_attempt:
+            self._segmented_recompute_attempted.discard(request_id)
+            self._segmented_recompute_deferred.discard(request_id)
 
     @property
     def usage(self) -> float:
@@ -571,6 +676,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self.release_segmented_recompute(request.request_id, reset_attempt=True)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -604,6 +710,10 @@ class KVCacheManager:
             The request's blocks in allocation order.
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
+
+    def pop_blocks_in_eviction_order(self, request: Request) -> list[KVCacheBlock]:
+        """Pop request blocks in cache-type-specific eviction order."""
+        return self.coordinator.pop_blocks_in_eviction_order(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

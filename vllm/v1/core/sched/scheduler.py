@@ -35,7 +35,11 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheBlocks,
+    KVCacheManager,
+    SegmentedRecomputeAction,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -610,6 +614,18 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
 
+            segmented_state = self.kv_cache_manager.get_segmented_recompute_state(
+                request.request_id
+            )
+            if segmented_state is not None and not segmented_state.ready_for_lookup:
+                repair_remaining = (
+                    segmented_state.repair_end - request.num_computed_tokens
+                )
+                if repair_remaining <= 0:
+                    req_index += 1
+                    continue
+                num_new_tokens = min(num_new_tokens, repair_remaining)
+
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -841,6 +857,7 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                prefix_stats_hits = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -851,6 +868,44 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    prefix_stats_hits = num_new_local_computed_tokens
+
+                    segmented_state = (
+                        self.kv_cache_manager.get_segmented_recompute_state(request_id)
+                    )
+                    if (
+                        self.connector is None
+                        and segmented_state is None
+                        and num_new_local_computed_tokens == 0
+                    ):
+                        action = self.kv_cache_manager.prepare_segmented_recompute(
+                            request
+                        )
+                        if action is SegmentedRecomputeAction.DEFER:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        if action is SegmentedRecomputeAction.START:
+                            segmented_state = (
+                                self.kv_cache_manager.get_segmented_recompute_state(
+                                    request_id
+                                )
+                            )
+                    if segmented_state is not None and segmented_state.ready_for_lookup:
+                        if num_new_local_computed_tokens < segmented_state.resume_at:
+                            logger.warning(
+                                "Segmented recompute lookup for %s reached %d, "
+                                "below pinned resume boundary %d; falling back",
+                                request_id,
+                                num_new_local_computed_tokens,
+                                segmented_state.resume_at,
+                            )
+                            self.kv_cache_manager.release_segmented_recompute(
+                                request_id
+                            )
+                            segmented_state = None
+                        else:
+                            prefix_stats_hits = segmented_state.skipped_tokens
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -935,7 +990,7 @@ class Scheduler(SchedulerInterface):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            num_local_cached_tokens=prefix_stats_hits,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                 else:
@@ -1006,6 +1061,19 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+
+                    segmented_state = (
+                        self.kv_cache_manager.get_segmented_recompute_state(request_id)
+                    )
+                    if (
+                        segmented_state is not None
+                        and not segmented_state.ready_for_lookup
+                    ):
+                        repair_remaining = (
+                            segmented_state.repair_end - num_computed_tokens
+                        )
+                        assert repair_remaining > 0
+                        num_new_tokens = min(num_new_tokens, repair_remaining)
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1129,8 +1197,14 @@ class Scheduler(SchedulerInterface):
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
-                        request, num_new_local_computed_tokens
+                        request, prefix_stats_hits
                     )
+
+                segmented_state = self.kv_cache_manager.get_segmented_recompute_state(
+                    request_id
+                )
+                if segmented_state is not None and segmented_state.ready_for_lookup:
+                    self.kv_cache_manager.finish_segmented_recompute(request_id)
 
                 request = request_queue.pop_request()
                 if load_kv_async:
@@ -1453,6 +1527,25 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def _complete_segmented_recompute_if_ready(self, request: Request) -> bool:
+        """Requeue a head repair after its last in-flight step completes."""
+        state = self.kv_cache_manager.get_segmented_recompute_state(request.request_id)
+        if (
+            state is None
+            or state.ready_for_lookup
+            or request.num_computed_tokens != state.repair_end
+            or request.num_in_flight_tokens != 0
+        ):
+            return False
+        self.kv_cache_manager.complete_segmented_recompute_head(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.is_prefill_chunk = True
+        self._inflight_prefills.discard(request)
+        self.waiting.prepend_request(request)
+        self.reset_preempted_req_ids.add(request.request_id)
+        return True
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1872,6 +1965,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        repair_requeued_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1894,6 +1988,10 @@ class Scheduler(SchedulerInterface):
                 # cache transfer in KV connector), the aborted request will not
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
+                continue
+
+            if self._complete_segmented_recompute_if_ready(request):
+                repair_requeued_reqs.add(request)
                 continue
 
             # Drop-mode stale output (same-step resume) is discarded entirely.
@@ -2127,6 +2225,8 @@ class Scheduler(SchedulerInterface):
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
+        if repair_requeued_reqs:
+            self.running = remove_all(self.running, repair_requeued_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -2539,9 +2639,12 @@ class Scheduler(SchedulerInterface):
         ):
             self.kv_cache_manager.free(request)
             return
-        blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+        self.kv_cache_manager.release_segmented_recompute(
+            request.request_id, reset_attempt=True
+        )
+        blocks = self.kv_cache_manager.pop_blocks_in_eviction_order(request)
         if blocks:
-            self.deferred_frees.append((self.sched_step_seq, blocks))
+            self.deferred_frees.append((self.sched_step_seq, blocks[::-1]))
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
@@ -2566,7 +2669,7 @@ class Scheduler(SchedulerInterface):
             if fence > self.processed_step_seq:
                 break
             _, blocks = self.deferred_frees.popleft()
-            # Free in reverse order so that the tail blocks are evicted first.
+            # Entries are stored in reverse eviction-priority order.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
 
     def get_num_unfinished_requests(self) -> int:

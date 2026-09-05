@@ -28,7 +28,12 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheBlocks,
+    KVCacheManager,
+    Request,
+    SegmentedRecomputeAction,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -50,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -4249,6 +4255,371 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     assert retained(0) == {14}
 
 
+@pytest.mark.parametrize("deferred_free", [False, True])
+def test_request_free_refreshes_latest_mamba_checkpoint_after_fa(
+    monkeypatch: pytest.MonkeyPatch, deferred_free: bool
+):
+    """Head-first release makes the latest GDN state newer than its FA KV."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=12,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    full_manager, mamba_manager = manager.coordinator.single_type_managers
+
+    # The recurrent checkpoint becomes free before request completion, so it
+    # is older than the FA blocks that are still owned by the request.
+    checkpoint = pool.get_new_blocks(1)[0]
+    checkpoint_hash = make_block_hash_with_group_id(BlockHash(b"checkpoint"), 1)
+    pool._insert_block_hash(checkpoint_hash, checkpoint, num_tokens=3 * block_size)
+    mamba_manager._record_checkpoint("request", checkpoint, pin=True)
+    pool.free_blocks([checkpoint])
+    assert checkpoint.ref_cnt == 1
+
+    full_blocks = pool.get_new_blocks(3)
+    for index, block in enumerate(full_blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(f"fa-{index}".encode()), 0),
+            block,
+            num_tokens=(index + 1) * block_size,
+        )
+    full_manager.req_to_blocks["request"] = full_blocks
+    # The final running state is not a cache checkpoint yet.
+    mamba_manager.req_to_blocks["request"] = pool.get_new_blocks(1)
+
+    # Exhaust the free pool before request completion. The latest checkpoint
+    # must survive because align-mode release retained one temporary reference.
+    pressure = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert pool.cached_block_hash_to_block.contain(checkpoint_hash, checkpoint.block_id)
+    pool.free_blocks(pressure)
+
+    if deferred_free:
+        blocks = manager.coordinator.pop_blocks_in_eviction_order("request")
+        assert blocks[-1] is checkpoint
+        assert checkpoint.ref_cnt == 1
+        pool.free_blocks(blocks)
+    else:
+        manager.coordinator.free("request")
+
+    free_order = pool.free_block_queue.get_all_free_blocks()
+    position = {block.block_id: index for index, block in enumerate(free_order)}
+    assert all(
+        position[block.block_id] < position[checkpoint.block_id]
+        for block in full_blocks
+    )
+    assert checkpoint.ref_cnt == 0
+
+
+def test_new_mamba_checkpoint_replaces_old_pin(monkeypatch: pytest.MonkeyPatch):
+    """Only the newest request checkpoint remains pinned."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    mamba_manager = manager.coordinator.single_type_managers[0]
+
+    old, new = pool.get_new_blocks(2)
+    for index, block in enumerate((old, new), start=1):
+        block_hash = make_block_hash_with_group_id(
+            BlockHash(f"checkpoint-{index}".encode()), 0
+        )
+        pool._insert_block_hash(block_hash, block, num_tokens=index * block_size)
+        mamba_manager._record_checkpoint("request", block, pin=True)
+        pool.free_blocks([block])
+
+    assert old.ref_cnt == 0
+    assert new.ref_cnt == 1
+
+
+def test_segmented_reuse_off_does_not_track_or_pin_mamba_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The disabled suite leaves upstream Mamba checkpoint ownership unchanged."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "0")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    mamba_manager = manager.coordinator.single_type_managers[0]
+    checkpoint = pool.get_new_blocks(1)[0]
+    checkpoint_hash = make_block_hash_with_group_id(BlockHash(b"checkpoint"), 0)
+    pool._insert_block_hash(checkpoint_hash, checkpoint, num_tokens=block_size)
+
+    mamba_manager._record_checkpoint("request", checkpoint, pin=True)
+    pool.free_blocks([checkpoint])
+
+    assert checkpoint.ref_cnt == 0
+    assert mamba_manager._latest_checkpoint_by_request == {}
+    assert mamba_manager._retained_checkpoints_by_request == {}
+
+
+def test_segmented_reuse_preserves_non_align_mamba_release(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The feature switch must not require checkpoint state from all-mode Mamba."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 8, ["full", "mamba"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    allocated: list[KVCacheBlock] = []
+    for cache_manager in manager.coordinator.single_type_managers:
+        block = pool.get_new_blocks(1)[0]
+        cache_manager.req_to_blocks["request"] = [block]
+        allocated.append(block)
+
+    manager.coordinator.free("request")
+
+    assert all(block.ref_cnt == 0 for block in allocated)
+
+
+def test_hybrid_release_orders_fa_segments_before_right_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Each GDN checkpoint outlives the FA segment immediately to its left."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=24,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    full_manager, mamba_manager = manager.coordinator.single_type_managers
+
+    full_blocks = pool.get_new_blocks(8)
+    for index, block in enumerate(full_blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(f"fa-{index}".encode()), 0),
+            block,
+            num_tokens=(index + 1) * block_size,
+        )
+    full_manager.req_to_blocks["request"] = full_blocks
+
+    checkpoints = pool.get_new_blocks(3)
+    for index, checkpoint in enumerate(checkpoints, start=1):
+        boundary_tokens = index * 2 * block_size
+        checkpoint_hash = make_block_hash_with_group_id(
+            BlockHash(f"checkpoint-{index}".encode()), 1
+        )
+        pool._insert_block_hash(
+            checkpoint_hash,
+            checkpoint,
+            num_tokens=boundary_tokens,
+        )
+        mamba_manager._record_checkpoint(
+            "request",
+            checkpoint,
+            pin=index == len(checkpoints),
+            retain=True,
+        )
+        pool.free_blocks([checkpoint])
+    mamba_manager.req_to_blocks["request"] = pool.get_new_blocks(1)
+
+    ordered = manager.coordinator.pop_blocks_in_eviction_order("request")
+    relevant_ids = {block.block_id for block in [*full_blocks, *checkpoints]}
+    relevant_order = [block for block in ordered if block.block_id in relevant_ids]
+
+    assert relevant_order == [
+        full_blocks[6],
+        full_blocks[7],
+        full_blocks[4],
+        full_blocks[5],
+        checkpoints[2],
+        full_blocks[2],
+        full_blocks[3],
+        checkpoints[1],
+        full_blocks[0],
+        full_blocks[1],
+        checkpoints[0],
+    ]
+    pool.free_blocks(ordered)
+    assert all(block.ref_cnt == 0 for block in checkpoints)
+
+
+def test_hybrid_release_requires_checkpoint_from_every_mamba_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An incomplete recurrent checkpoint cannot protect an FA segment."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    full_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["full"], full_spec),
+                KVCacheGroupSpec(["mamba-1"], mamba_spec),
+                KVCacheGroupSpec(["mamba-2"], mamba_spec),
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    full_manager, *mamba_managers = manager.coordinator.single_type_managers
+    full_blocks = pool.get_new_blocks(4)
+    for index, block in enumerate(full_blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(f"fa-{index}".encode()), 0),
+            block,
+            num_tokens=(index + 1) * block_size,
+        )
+    full_manager.req_to_blocks["request"] = full_blocks
+
+    checkpoints: dict[tuple[int, int], KVCacheBlock] = {}
+    for manager_index, mamba_manager in enumerate(mamba_managers, start=1):
+        boundaries = (
+            (2 * block_size, 3 * block_size)
+            if manager_index == 1
+            else (2 * block_size,)
+        )
+        for boundary_tokens in boundaries:
+            checkpoint = pool.get_new_blocks(1)[0]
+            checkpoint_hash = make_block_hash_with_group_id(
+                BlockHash(f"checkpoint-{manager_index}-{boundary_tokens}".encode()),
+                manager_index,
+            )
+            pool._insert_block_hash(
+                checkpoint_hash,
+                checkpoint,
+                num_tokens=boundary_tokens,
+            )
+            mamba_manager._record_checkpoint(
+                "request",
+                checkpoint,
+                pin=boundary_tokens == boundaries[-1],
+                retain=True,
+            )
+            pool.free_blocks([checkpoint])
+            checkpoints[manager_index, boundary_tokens] = checkpoint
+        mamba_manager.req_to_blocks["request"] = pool.get_new_blocks(1)
+
+    ordered = manager.coordinator.pop_blocks_in_eviction_order("request")
+    position = {block.block_id: index for index, block in enumerate(ordered)}
+    common_boundary = 2 * block_size
+    incomplete_boundary = 3 * block_size
+
+    # The incomplete checkpoint is fallback state, while both states at the
+    # common boundary are newer than all FA blocks on its left.
+    assert (
+        position[checkpoints[1, incomplete_boundary].block_id]
+        < position[full_blocks[0].block_id]
+    )
+    assert all(
+        position[full_blocks[index].block_id]
+        < position[checkpoints[manager_index, common_boundary].block_id]
+        for index in (0, 1)
+        for manager_index in (1, 2)
+    )
+    pool.free_blocks(ordered)
+
+
 def test_mamba_reachable_block_mask_pins_shared_prefix():
     """A Marconi-detected shared prefix (``shared_prefix_boundary``) lands before
     ``num_prompt`` so the replay-boundary rule alone would drop it. The mask must
@@ -4635,3 +5006,208 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
+    """A repaired head makes a pinned FA suffix and Mamba checkpoint reusable."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 50, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("segmented", list(range(20)), block_size, sha256)
+    pool = manager.block_pool
+
+    def cache_block(block_idx: int, group_id: int) -> KVCacheBlock:
+        block = pool.get_new_blocks(1)[0]
+        block_hash = make_block_hash_with_group_id(
+            request.block_hashes[block_idx], group_id
+        )
+        pool._insert_block_hash(
+            block_hash, block, num_tokens=(block_idx + 1) * block_size
+        )
+        pool.free_blocks([block])
+        return block
+
+    suffix_blocks = [cache_block(2, 0), cache_block(3, 0)]
+    checkpoint = cache_block(3, 1)
+    _, initial_hit, _ = manager.get_computed_blocks(request)
+    assert initial_hit == 0
+
+    assert (
+        manager.prepare_segmented_recompute(request) is SegmentedRecomputeAction.START
+    )
+    state = manager.get_segmented_recompute_state(request.request_id)
+    assert state is not None
+    assert (state.repair_end, state.resume_at, state.skipped_tokens) == (8, 16, 8)
+    assert all(block.ref_cnt == 1 for block in [*suffix_blocks, checkpoint])
+
+    full_manager = manager.coordinator.single_type_managers[0]
+    repaired_head = [pool.get_new_blocks(1)[0] for _ in range(2)]
+    for block_idx, block in enumerate(repaired_head):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(request.block_hashes[block_idx], 0),
+            block,
+            num_tokens=(block_idx + 1) * block_size,
+        )
+    full_manager.req_to_blocks[request.request_id] = repaired_head
+    manager.complete_segmented_recompute_head(request)
+    assert state.ready_for_lookup
+    assert all(block.ref_cnt == 1 for block in repaired_head)
+
+    computed, repaired_hit, _ = manager.get_computed_blocks(request)
+    assert repaired_hit == 16
+    allocated = manager.allocate_slots(
+        request,
+        num_new_tokens=4,
+        num_new_computed_tokens=repaired_hit,
+        new_computed_blocks=computed,
+    )
+    assert allocated is not None
+    assert manager.finish_segmented_recompute(request.request_id) == 8
+    assert manager.get_segmented_recompute_state(request.request_id) is None
+    assert all(block.ref_cnt >= 1 for block in [*repaired_head, *suffix_blocks])
+    manager.free(request)
+
+
+def test_segmented_recompute_accepts_partial_resume_boundary(monkeypatch):
+    """A fine-grained checkpoint may end inside the retained FA tail block."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 8
+    hash_block_size = 2
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 50, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    request = make_request(
+        "segmented-partial", list(range(20)), hash_block_size, sha256
+    )
+    pool = manager.block_pool
+    resume_at = 12
+    resume_hash = request.block_hashes[resume_at // hash_block_size - 1]
+
+    retained: list[KVCacheBlock] = []
+    for group_id in (0, 1):
+        block = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(resume_hash, group_id),
+            block,
+            num_tokens=resume_at,
+        )
+        pool.free_blocks([block])
+        retained.append(block)
+
+    assert (
+        manager.prepare_segmented_recompute(request) is SegmentedRecomputeAction.START
+    )
+    state = manager.get_segmented_recompute_state(request.request_id)
+    assert state is not None
+    assert (state.repair_end, state.resume_at, state.skipped_tokens) == (8, 12, 4)
+
+    full_manager = manager.coordinator.single_type_managers[0]
+    repaired_head = pool.get_new_blocks(1)
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(request.block_hashes[3], 0),
+        repaired_head[0],
+        num_tokens=8,
+    )
+    full_manager.req_to_blocks[request.request_id] = repaired_head
+    manager.complete_segmented_recompute_head(request)
+
+    _, repaired_hit, _ = manager.get_computed_blocks(request)
+    assert repaired_hit == resume_at
+    manager.release_segmented_recompute(request.request_id)
+    assert all(block.ref_cnt == 0 for block in [*retained, *repaired_head])
+
+
+def test_segmented_recompute_defers_recoverable_request_while_busy(monkeypatch):
+    """A second recoverable request must wait instead of becoming a 0-hit."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 50, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    first = make_request("first", list(range(20)), block_size, sha256)
+    second = make_request("second", list(range(20)), block_size, sha256)
+    cold = make_request("cold", list(range(100, 120)), block_size, sha256)
+    pool = manager.block_pool
+
+    for block_idx, group_id in ((2, 0), (3, 0), (3, 1)):
+        block = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(first.block_hashes[block_idx], group_id),
+            block,
+            num_tokens=(block_idx + 1) * block_size,
+        )
+        pool.free_blocks([block])
+
+    find_plan = manager.coordinator.find_segmented_recompute_plan
+    probe_count = 0
+
+    def counted_find_plan(*args, **kwargs):
+        nonlocal probe_count
+        probe_count += 1
+        return find_plan(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manager.coordinator,
+        "find_segmented_recompute_plan",
+        counted_find_plan,
+    )
+    assert manager.prepare_segmented_recompute(first) is SegmentedRecomputeAction.START
+    first_state = manager.get_segmented_recompute_state(first.request_id)
+    assert first_state is not None
+    assert manager.prepare_segmented_recompute(second) is SegmentedRecomputeAction.DEFER
+    assert manager.prepare_segmented_recompute(second) is SegmentedRecomputeAction.DEFER
+    assert probe_count == 2
+    assert manager.prepare_segmented_recompute(cold) is SegmentedRecomputeAction.NONE
+
+    manager.release_segmented_recompute(first.request_id)
+    assert manager.prepare_segmented_recompute(second) is SegmentedRecomputeAction.START
+    second_state = manager.get_segmented_recompute_state(second.request_id)
+    assert second_state is not None
+    assert (second_state.repair_end, second_state.resume_at) == (8, 16)
+    manager.release_segmented_recompute(second.request_id)
+    assert manager.prepare_segmented_recompute(cold) is SegmentedRecomputeAction.NONE
+
+
+def test_segmented_recompute_waits_for_inflight_head_steps():
+    """The scheduler must not reset the worker while a repair write is in flight."""
+    request = make_request("segmented", list(range(20)), 4, sha256)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 8
+    request.num_in_flight_tokens = 1
+    state = SimpleNamespace(repair_end=8, ready_for_lookup=False)
+    completed: list[str] = []
+    queued: list[Request] = []
+    mock = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            get_segmented_recompute_state=lambda request_id: state,
+            complete_segmented_recompute_head=lambda req: completed.append(
+                req.request_id
+            ),
+        ),
+        _inflight_prefills={request},
+        waiting=SimpleNamespace(prepend_request=queued.append),
+        reset_preempted_req_ids=set(),
+    )
+
+    complete = Scheduler._complete_segmented_recompute_if_ready
+    assert not complete(mock, request)
+    assert not completed and not queued
+
+    request.num_in_flight_tokens = 0
+    assert complete(mock, request)
+    assert completed == [request.request_id]
+    assert queued == [request]
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert request.request_id in mock.reset_preempted_req_ids
