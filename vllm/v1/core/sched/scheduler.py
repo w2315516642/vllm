@@ -38,7 +38,6 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import (
     KVCacheBlocks,
     KVCacheManager,
-    SegmentedRecomputeAction,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -861,6 +860,13 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    # Like native prefix hits, a read-only repair observation is
+                    # valid only for the scheduling attempt that produced it.
+                    # Re-probe before a later attempt instead of retaining stale
+                    # physical block objects across EngineCore steps.
+                    self.kv_cache_manager.discard_unscheduled_segmented_recompute(
+                        request_id
+                    )
                     did_prefix_cache_lookup = True
                     (
                         new_computed_blocks,
@@ -873,39 +879,42 @@ class Scheduler(SchedulerInterface):
                     segmented_state = (
                         self.kv_cache_manager.get_segmented_recompute_state(request_id)
                     )
-                    if (
-                        self.connector is None
-                        and segmented_state is None
-                        and num_new_local_computed_tokens == 0
-                    ):
-                        action = self.kv_cache_manager.prepare_segmented_recompute(
-                            request
+                    if self.connector is None and segmented_state is None:
+                        max_local_hit = request.num_tokens - 1
+                        repair_started = (
+                            self.kv_cache_manager.prepare_segmented_recompute(
+                                request, num_new_local_computed_tokens
+                            )
+                            if num_new_local_computed_tokens < max_local_hit
+                            else False
                         )
-                        if action is SegmentedRecomputeAction.DEFER:
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-                        if action is SegmentedRecomputeAction.START:
+                        if repair_started:
+                            # The first lookup is an internal repair probe. Record
+                            # only the post-repair lookup as the logical request hit.
+                            did_prefix_cache_lookup = False
                             segmented_state = (
                                 self.kv_cache_manager.get_segmented_recompute_state(
                                     request_id
                                 )
                             )
                     if segmented_state is not None and segmented_state.ready_for_lookup:
-                        if num_new_local_computed_tokens < segmented_state.resume_at:
+                        if (
+                            num_new_local_computed_tokens
+                            < segmented_state.resume_checkpoint
+                        ):
                             logger.warning(
                                 "Segmented recompute lookup for %s reached %d, "
-                                "below pinned resume boundary %d; falling back",
+                                "below retained resume checkpoint %d; falling back",
                                 request_id,
                                 num_new_local_computed_tokens,
-                                segmented_state.resume_at,
+                                segmented_state.resume_checkpoint,
                             )
                             self.kv_cache_manager.release_segmented_recompute(
                                 request_id
                             )
                             segmented_state = None
                         else:
-                            prefix_stats_hits = segmented_state.skipped_tokens
+                            prefix_stats_hits = segmented_state.cached_tokens
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1167,6 +1176,14 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    if segmented_state is not None:
+                        if segmented_state.retention_acquired:
+                            self.kv_cache_manager.release_segmented_recompute(
+                                request_id, reset_attempt=True
+                            )
+                        else:
+                            self.kv_cache_manager.defer_segmented_recompute(request_id)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1529,7 +1546,7 @@ class Scheduler(SchedulerInterface):
         self.reset_preempted_req_ids.add(request.request_id)
 
     def _complete_segmented_recompute_if_ready(self, request: Request) -> bool:
-        """Requeue a head repair after its last in-flight step completes."""
+        """Requeue an interval repair after its last in-flight step completes."""
         state = self.kv_cache_manager.get_segmented_recompute_state(request.request_id)
         if (
             state is None
@@ -1538,7 +1555,7 @@ class Scheduler(SchedulerInterface):
             or request.num_in_flight_tokens != 0
         ):
             return False
-        self.kv_cache_manager.complete_segmented_recompute_head(request)
+        self.kv_cache_manager.complete_segmented_recompute_interval(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         request.is_prefill_chunk = True

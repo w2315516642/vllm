@@ -32,7 +32,6 @@ from vllm.v1.core.kv_cache_manager import (
     KVCacheBlocks,
     KVCacheManager,
     Request,
-    SegmentedRecomputeAction,
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -5009,7 +5008,7 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
 
 
 def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
-    """A repaired head makes a pinned FA suffix and Mamba checkpoint reusable."""
+    """A repaired head makes a retained FA suffix and checkpoint reusable."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
     block_size = 4
     manager = make_kv_cache_manager(
@@ -5034,29 +5033,33 @@ def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
 
     suffix_blocks = [cache_block(2, 0), cache_block(3, 0)]
     checkpoint = cache_block(3, 1)
-    _, initial_hit, _ = manager.get_computed_blocks(request)
+    computed, initial_hit, _ = manager.get_computed_blocks(request)
     assert initial_hit == 0
 
-    assert (
-        manager.prepare_segmented_recompute(request) is SegmentedRecomputeAction.START
-    )
+    assert manager.prepare_segmented_recompute(request, 0)
     state = manager.get_segmented_recompute_state(request.request_id)
     assert state is not None
-    assert (state.repair_end, state.resume_at, state.skipped_tokens) == (8, 16, 8)
-    assert all(block.ref_cnt == 1 for block in [*suffix_blocks, checkpoint])
+    assert (
+        state.repair_start,
+        state.repair_end,
+        state.resume_checkpoint,
+        state.cached_tokens,
+    ) == (0, 8, 16, 8)
+    assert all(block.ref_cnt == 0 for block in [*suffix_blocks, checkpoint])
 
-    full_manager = manager.coordinator.single_type_managers[0]
-    repaired_head = [pool.get_new_blocks(1)[0] for _ in range(2)]
-    for block_idx, block in enumerate(repaired_head):
-        pool._insert_block_hash(
-            make_block_hash_with_group_id(request.block_hashes[block_idx], 0),
-            block,
-            num_tokens=(block_idx + 1) * block_size,
-        )
-    full_manager.req_to_blocks[request.request_id] = repaired_head
-    manager.complete_segmented_recompute_head(request)
+    allocated = manager.allocate_slots(
+        request,
+        num_new_tokens=state.repair_end,
+        num_new_computed_tokens=initial_hit,
+        new_computed_blocks=computed,
+    )
+    assert allocated is not None
+    assert state.retention_acquired
+    request.num_computed_tokens = state.repair_end
+    manager.cache_blocks(request, request.num_computed_tokens)
+    manager.complete_segmented_recompute_interval(request)
     assert state.ready_for_lookup
-    assert all(block.ref_cnt == 1 for block in repaired_head)
+    request.num_computed_tokens = 0
 
     computed, repaired_hit, _ = manager.get_computed_blocks(request)
     assert repaired_hit == 16
@@ -5069,7 +5072,7 @@ def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
     assert allocated is not None
     assert manager.finish_segmented_recompute(request.request_id) == 8
     assert manager.get_segmented_recompute_state(request.request_id) is None
-    assert all(block.ref_cnt >= 1 for block in [*repaired_head, *suffix_blocks])
+    assert all(block.ref_cnt >= 1 for block in suffix_blocks)
     manager.free(request)
 
 
@@ -5102,31 +5105,200 @@ def test_segmented_recompute_accepts_partial_resume_boundary(monkeypatch):
         pool.free_blocks([block])
         retained.append(block)
 
-    assert (
-        manager.prepare_segmented_recompute(request) is SegmentedRecomputeAction.START
-    )
+    assert manager.prepare_segmented_recompute(request, 0)
     state = manager.get_segmented_recompute_state(request.request_id)
     assert state is not None
-    assert (state.repair_end, state.resume_at, state.skipped_tokens) == (8, 12, 4)
+    assert (
+        state.repair_start,
+        state.repair_end,
+        state.resume_checkpoint,
+        state.cached_tokens,
+    ) == (0, 8, 12, 4)
 
-    full_manager = manager.coordinator.single_type_managers[0]
-    repaired_head = pool.get_new_blocks(1)
-    pool._insert_block_hash(
-        make_block_hash_with_group_id(request.block_hashes[3], 0),
-        repaired_head[0],
-        num_tokens=8,
+    allocated = manager.allocate_slots(
+        request,
+        num_new_tokens=state.repair_end,
     )
-    full_manager.req_to_blocks[request.request_id] = repaired_head
-    manager.complete_segmented_recompute_head(request)
+    assert allocated is not None
+    assert state.retention_acquired
+    request.num_computed_tokens = state.repair_end
+    manager.cache_blocks(request, request.num_computed_tokens)
+    manager.complete_segmented_recompute_interval(request)
+    request.num_computed_tokens = 0
 
     _, repaired_hit, _ = manager.get_computed_blocks(request)
     assert repaired_hit == resume_at
     manager.release_segmented_recompute(request.request_id)
-    assert all(block.ref_cnt == 0 for block in [*retained, *repaired_head])
+    assert all(block.ref_cnt == 0 for block in retained)
 
 
-def test_segmented_recompute_defers_recoverable_request_while_busy(monkeypatch):
-    """A second recoverable request must wait instead of becoming a 0-hit."""
+def test_segmented_recompute_repairs_middle_gap(monkeypatch):
+    """A native prefix hit can anchor repair of a later missing FA interval."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 50, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("middle-gap", list(range(20)), block_size, sha256)
+    pool = manager.block_pool
+
+    def cache_block(block_idx: int, group_id: int) -> KVCacheBlock:
+        block = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(request.block_hashes[block_idx], group_id),
+            block,
+            num_tokens=(block_idx + 1) * block_size,
+        )
+        pool.free_blocks([block])
+        return block
+
+    prefix_blocks = [cache_block(0, group_id) for group_id in (0, 1)]
+    suffix_blocks = [cache_block(block_idx, 0) for block_idx in (2, 3)]
+    resume_checkpoint = cache_block(3, 1)
+
+    computed, initial_hit, _ = manager.get_computed_blocks(request)
+    assert initial_hit == 4
+    assert manager.prepare_segmented_recompute(request, initial_hit)
+    state = manager.get_segmented_recompute_state(request.request_id)
+    assert state is not None
+    assert (
+        state.repair_start,
+        state.repair_end,
+        state.resume_checkpoint,
+        state.cached_tokens,
+    ) == (4, 8, 16, 12)
+    assert all(block.ref_cnt == 0 for block in [*suffix_blocks, resume_checkpoint])
+    assert all(block.ref_cnt == 0 for block in prefix_blocks)
+
+    allocated = manager.allocate_slots(
+        request,
+        num_new_tokens=state.repair_end - state.repair_start,
+        num_new_computed_tokens=initial_hit,
+        new_computed_blocks=computed,
+    )
+    assert allocated is not None
+    assert state.retention_acquired
+    request.num_computed_tokens = state.repair_end
+    manager.cache_blocks(request, request.num_computed_tokens)
+    manager.complete_segmented_recompute_interval(request)
+    request.num_computed_tokens = 0
+
+    repaired, repaired_hit, _ = manager.get_computed_blocks(request)
+    assert repaired_hit == state.resume_checkpoint
+    allocated = manager.allocate_slots(
+        request,
+        num_new_tokens=request.num_tokens - repaired_hit,
+        num_new_computed_tokens=repaired_hit,
+        new_computed_blocks=repaired,
+    )
+    assert allocated is not None
+    assert manager.finish_segmented_recompute(request.request_id) == 12
+    manager.free(request)
+
+
+def test_segmented_recompute_defer_does_not_change_lru(monkeypatch):
+    """A failed repair admission leaves cache references and LRU unchanged."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 20, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("deferred-repair", list(range(20)), block_size, sha256)
+    pool = manager.block_pool
+
+    retained: list[KVCacheBlock] = []
+    for block_idx, group_id in ((2, 0), (3, 0), (3, 1)):
+        block = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(request.block_hashes[block_idx], group_id),
+            block,
+            num_tokens=(block_idx + 1) * block_size,
+        )
+        pool.free_blocks([block])
+        retained.append(block)
+
+    lru_before = [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ]
+    assert manager.prepare_segmented_recompute(request, 0)
+    state = manager.get_segmented_recompute_state(request.request_id)
+    assert state is not None
+    assert not state.retention_acquired
+    assert all(block.ref_cnt == 0 for block in retained)
+
+    allocated = manager.allocate_slots(
+        request,
+        num_new_tokens=state.repair_end,
+        reserved_blocks=manager.block_pool.get_num_free_blocks(),
+    )
+    assert allocated is None
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == lru_before
+    assert all(block.ref_cnt == 0 for block in retained)
+
+    manager.defer_segmented_recompute(request.request_id)
+
+    lru_after = [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ]
+    assert lru_after == lru_before
+    assert all(block.ref_cnt == 0 for block in retained)
+    assert manager.get_segmented_recompute_state(request.request_id) is None
+
+
+def test_segmented_recompute_reprobes_after_unscheduled_candidate_eviction(
+    monkeypatch,
+):
+    """An unscheduled repair must not retain stale physical block objects."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 20, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("stale-repair", list(range(20)), block_size, sha256)
+    pool = manager.block_pool
+
+    for block_idx, group_id in ((2, 0), (3, 0), (3, 1)):
+        block = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(request.block_hashes[block_idx], group_id),
+            block,
+            num_tokens=(block_idx + 1) * block_size,
+        )
+        pool.free_blocks([block])
+
+    assert manager.prepare_segmented_recompute(request, 0)
+    state = manager.get_segmented_recompute_state(request.request_id)
+    assert state is not None
+    stale_block_ids = {block.block_id for block in state.retained_blocks}
+    assert all(block.ref_cnt == 0 for block in state.retained_blocks)
+
+    # The scheduling attempt ended before allocate_slots(). Other allocations
+    # may therefore evict and reuse the observed suffix blocks.
+    pressure = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert stale_block_ids.intersection(block.block_id for block in pressure)
+
+    manager.discard_unscheduled_segmented_recompute(request.request_id)
+    assert manager.get_segmented_recompute_state(request.request_id) is None
+    pool.free_blocks(pressure)
+
+    # Re-probing sees the current hash table instead of touching stale objects.
+    assert not manager.prepare_segmented_recompute(request, 0)
+    assert manager.get_segmented_recompute_state(request.request_id) is None
+
+
+def test_segmented_recompute_allows_native_budgeted_concurrency(monkeypatch):
+    """Repair candidates rely on native token and allocation budgets."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
     block_size = 4
     manager = make_kv_cache_manager(
@@ -5149,37 +5321,26 @@ def test_segmented_recompute_defers_recoverable_request_while_busy(monkeypatch):
         )
         pool.free_blocks([block])
 
-    find_plan = manager.coordinator.find_segmented_recompute_plan
-    probe_count = 0
-
-    def counted_find_plan(*args, **kwargs):
-        nonlocal probe_count
-        probe_count += 1
-        return find_plan(*args, **kwargs)
-
-    monkeypatch.setattr(
-        manager.coordinator,
-        "find_segmented_recompute_plan",
-        counted_find_plan,
-    )
-    assert manager.prepare_segmented_recompute(first) is SegmentedRecomputeAction.START
+    assert manager.prepare_segmented_recompute(first, 0)
     first_state = manager.get_segmented_recompute_state(first.request_id)
     assert first_state is not None
-    assert manager.prepare_segmented_recompute(second) is SegmentedRecomputeAction.DEFER
-    assert manager.prepare_segmented_recompute(second) is SegmentedRecomputeAction.DEFER
-    assert probe_count == 2
-    assert manager.prepare_segmented_recompute(cold) is SegmentedRecomputeAction.NONE
-
-    manager.release_segmented_recompute(first.request_id)
-    assert manager.prepare_segmented_recompute(second) is SegmentedRecomputeAction.START
+    assert manager.prepare_segmented_recompute(second, 0)
     second_state = manager.get_segmented_recompute_state(second.request_id)
     assert second_state is not None
-    assert (second_state.repair_end, second_state.resume_at) == (8, 16)
+    assert not manager.prepare_segmented_recompute(cold, 0)
+    assert len(manager._segmented_recompute) == 2
+
+    manager.release_segmented_recompute(first.request_id)
+    assert (
+        second_state.repair_start,
+        second_state.repair_end,
+        second_state.resume_checkpoint,
+    ) == (0, 8, 16)
     manager.release_segmented_recompute(second.request_id)
-    assert manager.prepare_segmented_recompute(cold) is SegmentedRecomputeAction.NONE
+    assert not manager.prepare_segmented_recompute(cold, 0)
 
 
-def test_segmented_recompute_waits_for_inflight_head_steps():
+def test_segmented_recompute_waits_for_inflight_interval_steps():
     """The scheduler must not reset the worker while a repair write is in flight."""
     request = make_request("segmented", list(range(20)), 4, sha256)
     request.status = RequestStatus.RUNNING
@@ -5191,7 +5352,7 @@ def test_segmented_recompute_waits_for_inflight_head_steps():
     mock = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             get_segmented_recompute_state=lambda request_id: state,
-            complete_segmented_recompute_head=lambda req: completed.append(
+            complete_segmented_recompute_interval=lambda req: completed.append(
                 req.request_id
             ),
         ),

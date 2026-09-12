@@ -4,7 +4,6 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Literal, overload
 
 from vllm import envs
@@ -118,14 +117,6 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
-class SegmentedRecomputeAction(Enum):
-    """Admission action after probing for a reusable cache suffix."""
-
-    NONE = auto()
-    START = auto()
-    DEFER = auto()
-
-
 class KVCacheManager:
     def __init__(
         self,
@@ -201,19 +192,15 @@ class KVCacheManager:
         )
         self._segmented_recompute: dict[str, SegmentedRecomputePlan] = {}
         self._segmented_recompute_attempted: set[str] = set()
-        self._segmented_recompute_deferred: set[str] = set()
+        self._segmented_recompute_allocation_deferrals: dict[str, int] = {}
 
     def get_segmented_recompute_state(
         self, request_id: str
     ) -> SegmentedRecomputePlan | None:
         return self._segmented_recompute.get(request_id)
 
-    def prepare_segmented_recompute(self, request: Request) -> SegmentedRecomputeAction:
-        """Probe once and either start, defer, or reject a head repair.
-
-        Only one request may repair at a time. This bounds pinned capacity and
-        prevents cross-request repair deadlocks.
-        """
+    def prepare_segmented_recompute(self, request: Request, repair_start: int) -> bool:
+        """Read a repair candidate without touching its cache blocks."""
         if (
             not envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
             or not self.enable_caching
@@ -221,13 +208,11 @@ class KVCacheManager:
             or request.request_id in self._segmented_recompute_attempted
             or not isinstance(self.coordinator, HybridKVCacheCoordinator)
         ):
-            return SegmentedRecomputeAction.NONE
-        if request.request_id in self._segmented_recompute_deferred:
-            if self._segmented_recompute:
-                return SegmentedRecomputeAction.DEFER
-            self._segmented_recompute_deferred.remove(request.request_id)
+            return False
         plan = self.coordinator.find_segmented_recompute_plan(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes,
+            request.num_tokens - 1,
+            repair_start,
         )
         if plan is None:
             self._segmented_recompute_attempted.add(request.request_id)
@@ -235,64 +220,66 @@ class KVCacheManager:
                 "Segmented recompute candidate unavailable for %s",
                 request.request_id,
             )
-            return SegmentedRecomputeAction.NONE
-        if self._segmented_recompute:
-            self._segmented_recompute_deferred.add(request.request_id)
-            return SegmentedRecomputeAction.DEFER
+            return False
         self._segmented_recompute_attempted.add(request.request_id)
-        self.block_pool.touch(plan.pinned_blocks)
         self._segmented_recompute[request.request_id] = plan
-        logger.info(
-            "Segmented recompute started for %s: repair [0, %d), reuse [%d, %d)",
-            request.request_id,
-            plan.repair_end,
-            plan.repair_end,
-            plan.resume_at,
-        )
-        return SegmentedRecomputeAction.START
+        return True
 
-    def complete_segmented_recompute_head(self, request: Request) -> None:
-        """Pin repaired full-attention head blocks and release repair state."""
-        state = self._segmented_recompute[request.request_id]
-        assert not state.ready_for_lookup
-        pinned_ids = {block.block_id for block in state.pinned_blocks}
-        repaired_blocks = self.coordinator.get_repaired_head_blocks(
-            request.request_id, state.repair_end, pinned_ids
+    def discard_unscheduled_segmented_recompute(self, request_id: str) -> None:
+        """Discard a cache observation that outlived its scheduling attempt."""
+        state = self._segmented_recompute.get(request_id)
+        if state is None or state.retention_acquired:
+            return
+        self._segmented_recompute.pop(request_id)
+        self._segmented_recompute_attempted.discard(request_id)
+
+    def defer_segmented_recompute(self, request_id: str) -> None:
+        """Discard an unscheduled candidate without changing cache recency."""
+        state = self._segmented_recompute.pop(request_id)
+        assert not state.retention_acquired
+        self._segmented_recompute_attempted.discard(request_id)
+        self._segmented_recompute_allocation_deferrals[request_id] = (
+            self._segmented_recompute_allocation_deferrals.get(request_id, 0) + 1
         )
-        assert repaired_blocks, "Head repair completed without cacheable head blocks"
+
+    def complete_segmented_recompute_interval(self, request: Request) -> None:
+        """Retain the completed FA prefix and prepare native prefix lookup."""
+        state = self._segmented_recompute[request.request_id]
+        assert state.retention_acquired
+        assert not state.ready_for_lookup
+        retained_ids = {block.block_id for block in state.retained_blocks}
+        repaired_blocks = self.coordinator.get_repaired_prefix_blocks(
+            request.request_id, state.repair_end, retained_ids
+        )
+        assert repaired_blocks, "Interval repair completed without cacheable FA blocks"
         self.block_pool.touch(repaired_blocks)
-        state.pinned_blocks.extend(repaired_blocks)
+        state.retained_blocks.extend(repaired_blocks)
         self.coordinator.free(request.request_id)
         state.ready_for_lookup = True
-        logger.info(
-            "Segmented recompute repaired head for %s at token %d",
-            request.request_id,
-            state.repair_end,
-        )
 
     def finish_segmented_recompute(self, request_id: str) -> int:
-        """Drop temporary pins after native prefix lookup owns all hit blocks."""
+        """Drop temporary retention after native lookup owns all hit blocks."""
         state = self._segmented_recompute.pop(request_id)
         assert state.ready_for_lookup
-        self.block_pool.free_blocks(state.pinned_blocks)
+        self.block_pool.free_blocks(state.retained_blocks)
         logger.info(
-            "Segmented recompute resumed %s at token %d; skipped %d tokens",
+            "Segmented recompute resumed %s at checkpoint %d; reused %d tokens",
             request_id,
-            state.resume_at,
-            state.skipped_tokens,
+            state.resume_checkpoint,
+            state.cached_tokens,
         )
-        return state.skipped_tokens
+        return state.cached_tokens
 
     def release_segmented_recompute(
         self, request_id: str, reset_attempt: bool = False
     ) -> None:
-        """Release repair pins and optionally allow a later admission retry."""
+        """Release repair retention and optionally allow a later retry."""
         state = self._segmented_recompute.pop(request_id, None)
-        if state is not None:
-            self.block_pool.free_blocks(state.pinned_blocks)
+        if state is not None and state.retention_acquired:
+            self.block_pool.free_blocks(state.retained_blocks)
         if reset_attempt:
             self._segmented_recompute_attempted.discard(request_id)
-            self._segmented_recompute_deferred.discard(request_id)
+            self._segmented_recompute_allocation_deferrals.pop(request_id, None)
 
     @property
     def usage(self) -> float:
@@ -554,6 +541,28 @@ class KVCacheManager:
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
+        segmented_state = self._segmented_recompute.get(request.request_id)
+        retained_blocks = (
+            segmented_state.retained_blocks
+            if segmented_state is not None
+            and not segmented_state.ready_for_lookup
+            and not segmented_state.retention_acquired
+            else ()
+        )
+        num_evictable_retained_blocks = 0
+        if retained_blocks:
+            computed_block_ids = {
+                block.block_id
+                for group_blocks in new_computed_block_list
+                for block in group_blocks
+            }
+            assert all(
+                block.block_id not in computed_block_ids for block in retained_blocks
+            )
+            num_evictable_retained_blocks = sum(
+                block.ref_cnt == 0 and not block.is_null for block in retained_blocks
+            )
+
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_local_computed_tokens = (
@@ -587,7 +596,11 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
+            required_blocks = (
+                num_blocks_to_allocate
+                + watermark_blocks
+                + num_evictable_retained_blocks
+            )
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
@@ -625,10 +638,40 @@ class KVCacheManager:
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
+        required_blocks = (
+            num_blocks_to_allocate
+            + watermark_blocks
+            + num_evictable_retained_blocks
+        )
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
+
+        if retained_blocks:
+            free_blocks_before = self.block_pool.get_num_free_blocks()
+            self.block_pool.touch(retained_blocks)
+            assert segmented_state is not None
+            segmented_state.retention_acquired = True
+            allocation_deferrals = self._segmented_recompute_allocation_deferrals.pop(
+                request.request_id, 0
+            )
+            logger.info(
+                "Segmented recompute scheduled request=%s native_hit=%d "
+                "repair=[%d,%d) resume_checkpoint=%d repair_tokens=%d "
+                "reused_tokens=%d retained_blocks=%d free_blocks_before=%d "
+                "free_blocks_after=%d allocation_deferrals=%d",
+                request.request_id,
+                segmented_state.repair_start,
+                segmented_state.repair_start,
+                segmented_state.repair_end,
+                segmented_state.resume_checkpoint,
+                segmented_state.repair_end - segmented_state.repair_start,
+                segmented_state.cached_tokens,
+                len(segmented_state.retained_blocks),
+                free_blocks_before,
+                self.block_pool.get_num_free_blocks(),
+                allocation_deferrals,
+            )
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks

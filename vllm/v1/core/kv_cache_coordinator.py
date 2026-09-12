@@ -37,16 +37,19 @@ logger = init_logger(__name__)
 
 @dataclass
 class SegmentedRecomputePlan:
-    """Missing head and cache-resident suffix used by two-phase recompute."""
+    """Missing FA interval and resident suffix used by two-phase recompute."""
 
+    repair_start: int
     repair_end: int
-    resume_at: int
-    pinned_blocks: list[KVCacheBlock]
+    resume_checkpoint: int
+    retained_blocks: list[KVCacheBlock]
+    retention_acquired: bool = False
     ready_for_lookup: bool = False
 
     @property
-    def skipped_tokens(self) -> int:
-        return self.resume_at - self.repair_end
+    def cached_tokens(self) -> int:
+        """Tokens reused before and after the repaired interval."""
+        return self.repair_start + self.resume_checkpoint - self.repair_end
 
 
 def _validate_prefix_cache_retention_interval(
@@ -1041,8 +1044,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        repair_start: int,
     ) -> SegmentedRecomputePlan | None:
-        """Find a missing head followed by a reusable FA/GDN suffix."""
+        """Find a missing FA interval followed by a reusable FA/GDN suffix."""
         if len(self.attention_groups) != 2:
             return None
         full_group, mamba_group = self.attention_groups
@@ -1054,51 +1058,54 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             return None
 
         mamba_manager = self.single_type_managers[mamba_group.group_ids[0]]
-        mamba_blocks, resume_at = mamba_group.manager_cls.find_longest_cache_hit(
-            block_hashes=block_hashes,
-            max_length=max_cache_hit_length,
-            kv_cache_group_ids=mamba_group.group_ids,
-            block_pool=self.block_pool,
-            kv_cache_spec=mamba_group.spec,
-            drop_eagle_block=False,
-            alignment_tokens=self._cache_hit_alignment_tokens,
-            dcp_world_size=mamba_manager.dcp_world_size,
-            pcp_world_size=mamba_manager.pcp_world_size,
+        mamba_blocks, resume_checkpoint = (
+            mamba_group.manager_cls.find_longest_cache_hit(
+                block_hashes=block_hashes,
+                max_length=max_cache_hit_length,
+                kv_cache_group_ids=mamba_group.group_ids,
+                block_pool=self.block_pool,
+                kv_cache_spec=mamba_group.spec,
+                drop_eagle_block=False,
+                alignment_tokens=self._cache_hit_alignment_tokens,
+                dcp_world_size=mamba_manager.dcp_world_size,
+                pcp_world_size=mamba_manager.pcp_world_size,
+            )
         )
-        if resume_at <= 0:
+        if resume_checkpoint <= repair_start:
             return None
 
         full_manager = self.single_type_managers[full_group.group_ids[0]]
         full_blocks, repair_end = full_group.manager_cls.find_cache_suffix_ending_at(
             block_hashes=block_hashes,
-            end_length=resume_at,
+            end_length=resume_checkpoint,
             kv_cache_group_ids=full_group.group_ids,
             block_pool=self.block_pool,
             kv_cache_spec=full_group.spec,
             dcp_world_size=full_manager.dcp_world_size,
             pcp_world_size=full_manager.pcp_world_size,
         )
-        if repair_end <= 0 or repair_end >= resume_at:
+        if repair_end <= repair_start or repair_end >= resume_checkpoint:
             return None
 
-        pinned = {
+        retained = {
             block.block_id: block
             for group in (*full_blocks, *mamba_blocks)
             for block in group
             if not block.is_null
         }
-        if not pinned:
+        if not retained:
             return None
         return SegmentedRecomputePlan(
+            repair_start=repair_start,
             repair_end=repair_end,
-            resume_at=resume_at,
-            pinned_blocks=list(pinned.values()),
+            resume_checkpoint=resume_checkpoint,
+            retained_blocks=list(retained.values()),
         )
 
-    def get_repaired_head_blocks(
+    def get_repaired_prefix_blocks(
         self, request_id: str, repair_end: int, excluded_ids: set[int]
     ) -> list[KVCacheBlock]:
-        """Return cacheable FA blocks produced by a completed head repair."""
+        """Return cacheable FA blocks through a completed interval repair."""
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             if not isinstance(manager, FullAttentionManager):
