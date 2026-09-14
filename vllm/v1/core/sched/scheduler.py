@@ -910,7 +910,7 @@ class Scheduler(SchedulerInterface):
                                 segmented_state.resume_checkpoint,
                             )
                             self.kv_cache_manager.release_segmented_recompute(
-                                request_id
+                                request_id, clear_deferrals=True
                             )
                             segmented_state = None
                         else:
@@ -1180,7 +1180,7 @@ class Scheduler(SchedulerInterface):
                     if segmented_state is not None:
                         if segmented_state.retention_acquired:
                             self.kv_cache_manager.release_segmented_recompute(
-                                request_id, reset_attempt=True
+                                request_id
                             )
                         else:
                             self.kv_cache_manager.defer_segmented_recompute(request_id)
@@ -2657,7 +2657,7 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.free(request)
             return
         self.kv_cache_manager.release_segmented_recompute(
-            request.request_id, reset_attempt=True
+            request.request_id, clear_deferrals=True
         )
         blocks = self.kv_cache_manager.pop_blocks_in_eviction_order(request)
         if blocks:

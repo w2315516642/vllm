@@ -5297,6 +5297,36 @@ def test_segmented_recompute_reprobes_after_unscheduled_candidate_eviction(
     assert manager.get_segmented_recompute_state(request.request_id) is None
 
 
+def test_segmented_recompute_reprobes_after_candidate_becomes_available(monkeypatch):
+    """A failed read-only probe must not suppress a later valid repair."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 20, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("late-repair", list(range(20)), block_size, sha256)
+
+    assert not manager.prepare_segmented_recompute(request, 0)
+
+    pool = manager.block_pool
+    for block_idx, group_id in ((2, 0), (3, 0), (3, 1)):
+        block = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(request.block_hashes[block_idx], group_id),
+            block,
+            num_tokens=(block_idx + 1) * block_size,
+        )
+        pool.free_blocks([block])
+
+    assert manager.prepare_segmented_recompute(request, 0)
+    state = manager.get_segmented_recompute_state(request.request_id)
+    assert state is not None
+    assert (state.repair_start, state.repair_end, state.resume_checkpoint) == (0, 8, 16)
+
+
 def test_segmented_recompute_allows_native_budgeted_concurrency(monkeypatch):
     """Repair candidates rely on native token and allocation budgets."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")

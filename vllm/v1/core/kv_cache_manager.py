@@ -191,7 +191,6 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
         self._segmented_recompute: dict[str, SegmentedRecomputePlan] = {}
-        self._segmented_recompute_attempted: set[str] = set()
         self._segmented_recompute_allocation_deferrals: dict[str, int] = {}
 
     def get_segmented_recompute_state(
@@ -205,7 +204,6 @@ class KVCacheManager:
             not envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
             or not self.enable_caching
             or request.has_encoder_inputs
-            or request.request_id in self._segmented_recompute_attempted
             or not isinstance(self.coordinator, HybridKVCacheCoordinator)
         ):
             return False
@@ -215,13 +213,11 @@ class KVCacheManager:
             repair_start,
         )
         if plan is None:
-            self._segmented_recompute_attempted.add(request.request_id)
             logger.debug(
                 "Segmented recompute candidate unavailable for %s",
                 request.request_id,
             )
             return False
-        self._segmented_recompute_attempted.add(request.request_id)
         self._segmented_recompute[request.request_id] = plan
         return True
 
@@ -231,13 +227,11 @@ class KVCacheManager:
         if state is None or state.retention_acquired:
             return
         self._segmented_recompute.pop(request_id)
-        self._segmented_recompute_attempted.discard(request_id)
 
     def defer_segmented_recompute(self, request_id: str) -> None:
         """Discard an unscheduled candidate without changing cache recency."""
         state = self._segmented_recompute.pop(request_id)
         assert not state.retention_acquired
-        self._segmented_recompute_attempted.discard(request_id)
         self._segmented_recompute_allocation_deferrals[request_id] = (
             self._segmented_recompute_allocation_deferrals.get(request_id, 0) + 1
         )
@@ -271,14 +265,13 @@ class KVCacheManager:
         return state.cached_tokens
 
     def release_segmented_recompute(
-        self, request_id: str, reset_attempt: bool = False
+        self, request_id: str, clear_deferrals: bool = False
     ) -> None:
-        """Release repair retention and optionally allow a later retry."""
+        """Release repair retention and optionally clear admission diagnostics."""
         state = self._segmented_recompute.pop(request_id, None)
         if state is not None and state.retention_acquired:
             self.block_pool.free_blocks(state.retained_blocks)
-        if reset_attempt:
-            self._segmented_recompute_attempted.discard(request_id)
+        if clear_deferrals:
             self._segmented_recompute_allocation_deferrals.pop(request_id, None)
 
     @property
@@ -719,7 +712,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.release_segmented_recompute(request.request_id, reset_attempt=True)
+        self.release_segmented_recompute(request.request_id, clear_deferrals=True)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
