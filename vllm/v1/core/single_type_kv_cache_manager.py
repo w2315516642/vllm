@@ -1473,6 +1473,10 @@ class MambaManager(SingleTypeKVCacheManager):
             self._retained_checkpoints_by_request: dict[
                 str, dict[int, _MambaCheckpoint]
             ] = {}
+            # A shared-prefix checkpoint remains pinned while its request is
+            # alive. Otherwise align-mode state rotation can put the
+            # boundary into the free queue before later sharing requests use it.
+            self._shared_prefix_boundary_by_request: dict[str, int] = {}
 
     def _record_checkpoint(
         self,
@@ -1483,7 +1487,7 @@ class MambaManager(SingleTypeKVCacheManager):
         pin: bool = False,
         retain: bool = False,
     ) -> None:
-        """Track a replay checkpoint and pin only the newest running state."""
+        """Track replay checkpoints and preserve a shared-prefix boundary."""
         if (
             not envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
             or self.mamba_cache_mode != "align"
@@ -1512,7 +1516,18 @@ class MambaManager(SingleTypeKVCacheManager):
             previous.num_tokens = num_tokens
             return
         if previous is not None and previous.pinned:
-            self.block_pool.free_blocks([previous.block])
+            shared_prefix_boundary = self._shared_prefix_boundary_by_request.get(
+                request_id
+            )
+            if previous.num_tokens == shared_prefix_boundary:
+                # Transfer the existing latest-state pin into retained
+                # request-lifetime ownership. Do not touch the block again:
+                # ``previous.pinned`` already represents the extra reference.
+                self._retained_checkpoints_by_request.setdefault(request_id, {})[
+                    previous.num_tokens
+                ] = previous
+            else:
+                self.block_pool.free_blocks([previous.block])
         if pin:
             self.block_pool.touch([block])
         self._latest_checkpoint_by_request[request_id] = _MambaCheckpoint(
@@ -1525,6 +1540,7 @@ class MambaManager(SingleTypeKVCacheManager):
         """Pop request blocks and detach its cache-resident checkpoints."""
         retained = self._retained_checkpoints_by_request.pop(request_id, {})
         latest = self._latest_checkpoint_by_request.pop(request_id, None)
+        self._shared_prefix_boundary_by_request.pop(request_id, None)
         blocks = list(reversed(self.pop_blocks_for_free(request_id)))
         checkpoints = dict(retained)
         if latest is not None:
@@ -1536,23 +1552,22 @@ class MambaManager(SingleTypeKVCacheManager):
         detached: list[tuple[int, KVCacheBlock]] = []
         for boundary, checkpoint in sorted(checkpoints.items()):
             block = checkpoint.block
-            is_latest = checkpoint is latest
             if block.block_id in detached_ids:
-                if is_latest and checkpoint.pinned:
+                if checkpoint.pinned:
                     self.block_pool.free_blocks([block])
                 continue
             if not self.block_pool.cached_block_hash_to_block.contain(
                 checkpoint.block_hash, block.block_id
             ):
-                if is_latest and checkpoint.pinned:
+                if checkpoint.pinned:
                     self.block_pool.free_blocks([block])
                 continue
 
             owned_index = owned_indices.get(block.block_id)
             if owned_index is not None:
-                if not (is_latest and checkpoint.pinned):
+                if not checkpoint.pinned:
                     detached_indices.add(owned_index)
-            elif not (is_latest and checkpoint.pinned):
+            elif not checkpoint.pinned:
                 if block.ref_cnt != 0:
                     continue
                 self.block_pool.touch([block])
@@ -2014,10 +2029,16 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
-            self._retained_checkpoints_by_request.pop(request_id, None)
+            self._shared_prefix_boundary_by_request.pop(request_id, None)
+            retained = self._retained_checkpoints_by_request.pop(request_id, {})
             latest = self._latest_checkpoint_by_request.pop(request_id, None)
+            pinned = [
+                checkpoint for checkpoint in retained.values() if checkpoint.pinned
+            ]
             if latest is not None and latest.pinned:
-                self.block_pool.free_blocks([latest.block])
+                pinned.append(latest)
+            if pinned:
+                self.block_pool.free_blocks([checkpoint.block for checkpoint in pinned])
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -2044,6 +2065,14 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        if (
+            envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
+            and self.mamba_cache_mode == "align"
+            and request.shared_prefix_boundary > 0
+        ):
+            self._shared_prefix_boundary_by_request[request.request_id] = (
+                request.shared_prefix_boundary
+            )
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)

@@ -4376,6 +4376,68 @@ def test_new_mamba_checkpoint_replaces_old_pin(monkeypatch: pytest.MonkeyPatch):
     assert new.ref_cnt == 1
 
 
+def test_shared_prefix_checkpoint_stays_pinned_until_request_free(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """State rotation must not release the request's shared-prefix boundary."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    pool = manager.block_pool
+    mamba_manager = manager.coordinator.single_type_managers[0]
+    request = make_request("request", [1] * (2 * block_size), block_size, sha256)
+    request.shared_prefix_boundary = block_size
+
+    # ``cache_blocks`` is the normal point at which the scheduler-provided
+    # boundary becomes request-lifetime checkpoint metadata.
+    mamba_manager.cache_blocks(request, 0)
+    boundary, newer = pool.get_new_blocks(2)
+    for index, block in enumerate((boundary, newer), start=1):
+        block_hash = make_block_hash_with_group_id(
+            BlockHash(f"checkpoint-{index}".encode()), 0
+        )
+        pool._insert_block_hash(block_hash, block, num_tokens=index * block_size)
+        mamba_manager._record_checkpoint("request", block, pin=True)
+        pool.free_blocks([block])
+
+    # Advancing the latest state keeps both the shared boundary and the newest
+    # checkpoint alive; an unrelated allocation cannot recycle either block.
+    assert boundary.ref_cnt == 1
+    assert newer.ref_cnt == 1
+    pressure = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert boundary not in pressure
+    assert newer not in pressure
+    pool.free_blocks(pressure)
+
+    # The segmented request-free path returns both protected checkpoints to the
+    # coordinator's ordered release list, where each pin is released once.
+    request_blocks, checkpoints = mamba_manager.pop_blocks_and_checkpoints("request")
+    assert [boundary for boundary, _ in checkpoints] == [block_size, 2 * block_size]
+    pool.free_blocks(request_blocks + [block for _, block in checkpoints])
+    assert boundary.ref_cnt == 0
+    assert newer.ref_cnt == 0
+    assert "request" not in mamba_manager._shared_prefix_boundary_by_request
+
+
 def test_segmented_reuse_off_does_not_track_or_pin_mamba_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ):
