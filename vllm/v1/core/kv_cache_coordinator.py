@@ -52,6 +52,15 @@ class SegmentedRecomputePlan:
         return self.repair_start + self.resume_checkpoint - self.repair_end
 
 
+class SegmentedRecomputeProbe(NamedTuple):
+    """A repair candidate and the cache boundaries used to derive it."""
+
+    plan: SegmentedRecomputePlan | None
+    resume_checkpoint: int
+    fa_suffix_start: int
+    reason: str
+
+
 def _validate_prefix_cache_retention_interval(
     retention_interval: int | None,
     scheduler_block_size: int,
@@ -1045,17 +1054,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
         repair_start: int,
-    ) -> SegmentedRecomputePlan | None:
+    ) -> SegmentedRecomputeProbe:
         """Find a missing FA interval followed by a reusable FA/GDN suffix."""
         if len(self.attention_groups) != 2:
-            return None
+            return SegmentedRecomputeProbe(None, 0, 0, "unsupported_group_count")
         full_group, mamba_group = self.attention_groups
         if not isinstance(full_group.spec, FullAttentionSpec) or not isinstance(
             mamba_group.spec, MambaSpec
         ):
-            return None
+            return SegmentedRecomputeProbe(None, 0, 0, "unsupported_group_layout")
         if mamba_group.spec.mamba_cache_mode != "align":
-            return None
+            return SegmentedRecomputeProbe(None, 0, 0, "mamba_mode_not_align")
 
         mamba_manager = self.single_type_managers[mamba_group.group_ids[0]]
         mamba_blocks, resume_checkpoint = (
@@ -1072,7 +1081,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
         )
         if resume_checkpoint <= repair_start:
-            return None
+            return SegmentedRecomputeProbe(
+                None,
+                resume_checkpoint,
+                resume_checkpoint,
+                "checkpoint_not_beyond_native_hit",
+            )
 
         full_manager = self.single_type_managers[full_group.group_ids[0]]
         full_blocks, repair_end = full_group.manager_cls.find_cache_suffix_ending_at(
@@ -1084,8 +1098,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             dcp_world_size=full_manager.dcp_world_size,
             pcp_world_size=full_manager.pcp_world_size,
         )
-        if repair_end <= repair_start or repair_end >= resume_checkpoint:
-            return None
+        if repair_end <= repair_start:
+            return SegmentedRecomputeProbe(
+                None,
+                resume_checkpoint,
+                repair_end,
+                "no_missing_fa_interval",
+            )
+        if repair_end >= resume_checkpoint:
+            return SegmentedRecomputeProbe(
+                None,
+                resume_checkpoint,
+                repair_end,
+                "no_reusable_fa_suffix",
+            )
 
         retained = {
             block.block_id: block
@@ -1094,12 +1120,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if not block.is_null
         }
         if not retained:
-            return None
-        return SegmentedRecomputePlan(
-            repair_start=repair_start,
-            repair_end=repair_end,
-            resume_checkpoint=resume_checkpoint,
-            retained_blocks=list(retained.values()),
+            return SegmentedRecomputeProbe(
+                None,
+                resume_checkpoint,
+                repair_end,
+                "no_blocks_to_retain",
+            )
+        return SegmentedRecomputeProbe(
+            SegmentedRecomputePlan(
+                repair_start=repair_start,
+                repair_end=repair_end,
+                resume_checkpoint=resume_checkpoint,
+                retained_blocks=list(retained.values()),
+            ),
+            resume_checkpoint,
+            repair_end,
+            "candidate_available",
         )
 
     def get_repaired_prefix_blocks(

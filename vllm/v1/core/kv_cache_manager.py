@@ -192,6 +192,9 @@ class KVCacheManager:
         )
         self._segmented_recompute: dict[str, SegmentedRecomputePlan] = {}
         self._segmented_recompute_allocation_deferrals: dict[str, int] = {}
+        self._segmented_recompute_probe_diagnostics: dict[
+            str, tuple[int, int, int, str]
+        ] = {}
 
     def get_segmented_recompute_state(
         self, request_id: str
@@ -207,18 +210,43 @@ class KVCacheManager:
             or not isinstance(self.coordinator, HybridKVCacheCoordinator)
         ):
             return False
-        plan = self.coordinator.find_segmented_recompute_plan(
+        probe = self.coordinator.find_segmented_recompute_plan(
             request.block_hashes,
             request.num_tokens - 1,
             repair_start,
         )
-        if plan is None:
+        if probe.plan is None:
+            diagnostic = (
+                repair_start,
+                probe.resume_checkpoint,
+                probe.fa_suffix_start,
+                probe.reason,
+            )
+            if (
+                self._segmented_recompute_probe_diagnostics.get(request.request_id)
+                != diagnostic
+            ):
+                logger.info(
+                    "Segmented recompute unavailable request=%s "
+                    "native_hit=%d resume_checkpoint=%d fa_suffix_start=%d "
+                    "free_blocks=%d reason=%s",
+                    request.request_id,
+                    repair_start,
+                    probe.resume_checkpoint,
+                    probe.fa_suffix_start,
+                    self.block_pool.get_num_free_blocks(),
+                    probe.reason,
+                )
+                self._segmented_recompute_probe_diagnostics[request.request_id] = (
+                    diagnostic
+                )
             logger.debug(
                 "Segmented recompute candidate unavailable for %s",
                 request.request_id,
             )
             return False
-        self._segmented_recompute[request.request_id] = plan
+        self._segmented_recompute_probe_diagnostics.pop(request.request_id, None)
+        self._segmented_recompute[request.request_id] = probe.plan
         return True
 
     def discard_unscheduled_segmented_recompute(self, request_id: str) -> None:
@@ -273,6 +301,7 @@ class KVCacheManager:
             self.block_pool.free_blocks(state.retained_blocks)
         if clear_deferrals:
             self._segmented_recompute_allocation_deferrals.pop(request_id, None)
+            self._segmented_recompute_probe_diagnostics.pop(request_id, None)
 
     @property
     def usage(self) -> float:
