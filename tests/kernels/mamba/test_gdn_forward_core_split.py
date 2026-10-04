@@ -22,14 +22,15 @@ Both paths are exercised through the REAL ``_forward_core``:
   non-spec tokens in both paths, so it cancels out and only the recurrent split
   is compared).
 
-The Triton/FLA chunk backend is forced so the prefill-only ``chunk_indices``
-must stay consistent with the rebased ``cu_seqlens`` (a stringent, backend
-portable check of the split wiring).
+The Triton/FLA backend is used on pre-Blackwell CUDA devices and CuteDSL on
+Blackwell. The prefill-only chunk metadata must match the rebased sequence
+lengths. The Triton path also checks fused state I/O against the original path.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
 import types
 from unittest.mock import patch
 
@@ -38,14 +39,12 @@ import torch
 
 from vllm.platforms import current_platform
 
-if not (
-    current_platform.is_cuda() and current_platform.is_device_capability_family(100)
-):
-    pytest.skip(
-        reason="GDN _forward_core split test uses the CuteDSL prefill backend "
-        "(requires CUDA SM10x).",
-        allow_module_level=True,
-    )
+if not current_platform.is_cuda():
+    pytest.skip(reason="GDN forward-core test requires CUDA.", allow_module_level=True)
+
+PREFILL_BACKEND = (
+    "cutedsl" if current_platform.is_device_capability_family(100) else "triton"
+)
 
 from tests.v1.attention.utils import (  # noqa: E402
     BatchSpec,
@@ -87,18 +86,13 @@ PREFIX = "model.layers.0.linear_attn"
 
 
 def _make_vllm_config():
-    # A small, ungated GDN model whose config is cached locally; only the config
-    # (scheduler/cache/compilation/hf) is used here, never the weights. Inject
-    # linear_key_head_dim=128 and request the CuteDSL prefill backend -- the
-    # supported GDN chunk kernel on Blackwell (the Triton/FLA chunk kernel is
-    # unsupported on SM10x). CuteDSL consumes chunk_indices/chunk_offsets, so
-    # this also exercises the prefill-only chunk-metadata wiring.
+    # Only the config is loaded. Use CuteDSL on Blackwell, Triton elsewhere.
     cfg = create_vllm_config(
-        model_name="Qwen/Qwen3.5-0.8B",
+        model_name=os.environ.get("GDN_TEST_MODEL_PATH", "Qwen/Qwen3.5-0.8B"),
         block_size=BLOCK_SIZE,
         hf_config_override={"linear_key_head_dim": K},
     )
-    cfg.additional_config = {"gdn_prefill_backend": "cutedsl"}
+    cfg.additional_config = {"gdn_prefill_backend": PREFILL_BACKEND}
     return cfg
 
 
@@ -109,6 +103,7 @@ def _build_layer(
     layer = types.SimpleNamespace()
     layer.prefix = PREFIX
     layer.enable_packed_recurrent_decode = False
+    layer.use_fused_state_io = False
     layer.tp_size = 1
     layer.num_k_heads = H
     layer.num_v_heads = HV
@@ -150,6 +145,7 @@ def _run_forward_core(layer, meta, mixed_qkv, b, a, num_tokens):
     return core_attn_out
 
 
+@pytest.mark.parametrize("use_fused_state_io", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_decodes,prefill_lens", [(3, [512, 300]), (4, [64, 5])])
 @pytest.mark.parametrize("fresh_prefill", [False, True])
@@ -158,7 +154,10 @@ def test_forward_core_split_matches_unified(
     num_decodes: int,
     prefill_lens: list[int],
     fresh_prefill: bool,
+    use_fused_state_io: bool,
 ) -> None:
+    if use_fused_state_io and PREFILL_BACKEND != "triton":
+        pytest.skip("Fused state I/O integration currently targets Triton prefill.")
     torch.manual_seed(0)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
@@ -193,7 +192,7 @@ def test_forward_core_split_matches_unified(
     assert meta_split.num_decodes == num_decodes
     assert meta_split.num_prefills == len(prefill_lens)
     assert meta_split.num_decode_tokens == num_decodes
-    assert builder.gdn_prefill_backend == "cutedsl"
+    assert builder.gdn_prefill_backend == PREFILL_BACKEND
 
     num_tokens = sum(query_lens)
 
@@ -271,6 +270,7 @@ def test_forward_core_split_matches_unified(
         conv_weight,
         conv_bias,
     )
+    layer_split.use_fused_state_io = use_fused_state_io
     out_split = _run_forward_core(layer_split, meta_split, mixed_qkv, b, a, num_tokens)
 
     # ---- Unified path (real _forward_core, meta_unified) ----
@@ -285,6 +285,7 @@ def test_forward_core_split_matches_unified(
         conv_weight,
         conv_bias,
     )
+    layer_unified.use_fused_state_io = use_fused_state_io
     out_unified = _run_forward_core(
         layer_unified, meta_unified, mixed_qkv, b, a, num_tokens
     )
@@ -300,3 +301,18 @@ def test_forward_core_split_matches_unified(
         atol = rtol = 6e-2
     torch.testing.assert_close(out_split, out_unified, atol=atol, rtol=rtol)
     torch.testing.assert_close(ssm_state_split, ssm_state_unified, atol=atol, rtol=rtol)
+
+    if use_fused_state_io:
+        # Same GDN math: state-I/O fusion must preserve outputs and both pools.
+        for meta, output, conv, state in (
+            (meta_split, out_split, conv_state_split, ssm_state_split),
+            (meta_unified, out_unified, conv_state_unified, ssm_state_unified),
+        ):
+            ref_conv, ref_state = conv_state0.clone(), ssm_state0.clone()
+            ref_layer = _build_layer(
+                vllm_config, ref_conv, ref_state, A_log, dt_bias, conv_weight, conv_bias
+            )
+            ref_output = _run_forward_core(ref_layer, meta, mixed_qkv, b, a, num_tokens)
+            torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
+            torch.testing.assert_close(conv, ref_conv, rtol=0, atol=0)
+            torch.testing.assert_close(state, ref_state, rtol=0, atol=0)

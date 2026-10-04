@@ -387,3 +387,49 @@ def test_fused_gdn_decode_post_conv_mtp_head_ratios(
         )
 
     torch.testing.assert_close(state_actual, state_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("shape", [(4, 128, 128), (2, 7, 17)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_gdn_state_io_preserves_pool_and_zeroes_fresh_states(
+    state_dtype, index_dtype, shape, strided
+):
+    """Match PyTorch including column-view indices, NaNs and padded cache pages."""
+    from vllm.model_executor.layers.mamba.ops.gdn_state_io import (
+        gather_gdn_state,
+        scatter_gdn_state,
+    )
+
+    torch.manual_seed(42)
+    h, v, k = shape
+    width = h * v * k
+    backing = torch.randn(
+        (7, width + (256 if strided else 0)), device="cuda", dtype=state_dtype
+    )
+    pool = backing[:, :width].view(7, h, v, k)
+    ids = torch.tensor([6, 0, 3], device="cuda", dtype=index_dtype)
+    if strided:
+        ids = torch.stack((ids, torch.zeros_like(ids)), dim=1)[:, 0]
+    for flags in ([True] * 3, [False] * 3, [True, False, True]):
+        valid = torch.tensor(flags, device="cuda")
+        if strided:
+            valid = torch.stack((valid, ~valid), dim=1)[:, 0]
+        pool[ids[~valid]] = float("nan")
+        before = backing.clone()
+        expected = pool[ids]
+        expected[~valid] = 0
+        output = gather_gdn_state(pool, ids, valid)
+        torch.testing.assert_close(output, expected, atol=0, rtol=0, equal_nan=True)
+        torch.testing.assert_close(backing, before, atol=0, rtol=0, equal_nan=True)
+        src = torch.randn((3, h, v, k * (2 if strided else 1)), device="cuda")
+        if strided:
+            src = src[..., ::2]
+        expected_backing = backing.clone()
+        expected_pool = expected_backing[:, :width].view(7, h, v, k)
+        expected_pool[ids] = src.to(state_dtype)
+        scatter_gdn_state(pool, ids, src)
+        torch.testing.assert_close(
+            backing, expected_backing, atol=0, rtol=0, equal_nan=True
+        )

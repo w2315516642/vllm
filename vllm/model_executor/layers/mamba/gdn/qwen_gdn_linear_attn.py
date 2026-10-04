@@ -38,6 +38,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_state_io import (
+    gather_gdn_state,
+    scatter_gdn_state,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -496,6 +500,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        state_io_requested = (
+            vllm_config.additional_config.get("gdn_fused_state_io", False)
+            if isinstance(vllm_config.additional_config, dict)
+            else False
+        )
+        if not isinstance(state_io_requested, bool):
+            raise ValueError("gdn_fused_state_io must be a boolean")
+        self.use_fused_state_io = (
+            state_io_requested
+            and current_platform.is_cuda()
+            and self.gdn_prefill_backend == "triton"
+        )
+        if state_io_requested and not self.use_fused_state_io:
+            raise ValueError(
+                "gdn_fused_state_io requires the CUDA Triton prefill backend"
+            )
+        if self.use_fused_state_io:
+            logger.info_once("GDN fused prefill state I/O enabled.")
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -1514,8 +1536,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            if self.use_fused_state_io:
+                initial_state = gather_gdn_state(
+                    ssm_state, prefill_state_indices, prefill_has_initial_state
+                )
+            else:
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[~prefill_has_initial_state, ...] = 0
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1533,7 +1560,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if self.use_fused_state_io:
+                scatter_gdn_state(
+                    ssm_state, prefill_state_indices, last_recurrent_state
+                )
+            else:
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
