@@ -4502,11 +4502,14 @@ def test_segmented_reuse_preserves_non_align_mamba_release(
     assert all(block.ref_cnt == 0 for block in allocated)
 
 
+@pytest.mark.parametrize("recompute", ["0", "1"])
 def test_hybrid_release_orders_fa_segments_before_right_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
+    recompute: str,
 ):
     """Each GDN checkpoint outlives the FA segment immediately to its left."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE", recompute)
     block_size = 4
     manager = make_kv_cache_manager(
         kv_cache_config=KVCacheConfig(
@@ -5069,9 +5072,42 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
 
 
-def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
+@pytest.mark.parametrize("reuse,recompute", [("0", "0"), ("0", "1"), ("1", "0")])
+def test_segmented_recompute_disabled_skips_probe(monkeypatch, reuse, recompute):
+    """A disabled repair path must not probe or acquire cached blocks."""
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", reuse)
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE", recompute)
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(4, 50, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=4,
+    )
+    request = make_request("disabled-repair", list(range(20)), 4, sha256)
+    pool = manager.block_pool
+    free_before = pool.free_block_queue.get_all_free_blocks()
+    refs_before = [block.ref_cnt for block in pool.blocks]
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("Disabled segmented recompute must not scan candidates")
+
+    monkeypatch.setattr(
+        manager.coordinator, "find_segmented_recompute_plan", unexpected_probe
+    )
+    assert not manager.prepare_segmented_recompute(request, 0)
+    assert manager.get_segmented_recompute_state(request.request_id) is None
+    assert pool.free_block_queue.get_all_free_blocks() == free_before
+    assert [block.ref_cnt for block in pool.blocks] == refs_before
+
+
+@pytest.mark.parametrize("recompute", [None, "1"])
+def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch, recompute):
     """A repaired head makes a retained FA suffix and checkpoint reusable."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
+    if recompute is None:
+        monkeypatch.delenv("VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE", recompute)
     block_size = 4
     manager = make_kv_cache_manager(
         _make_hybrid_kv_cache_config(block_size, 50, ["full", "mamba_align"]),

@@ -205,6 +205,7 @@ class KVCacheManager:
         """Read a repair candidate without touching its cache blocks."""
         if (
             not envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
+            or not envs.VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE
             or not self.enable_caching
             or request.has_encoder_inputs
             or not isinstance(self.coordinator, HybridKVCacheCoordinator)
@@ -661,9 +662,7 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = (
-            num_blocks_to_allocate
-            + watermark_blocks
-            + num_evictable_retained_blocks
+            num_blocks_to_allocate + watermark_blocks + num_evictable_retained_blocks
         )
         if required_blocks > available_blocks:
             # Cannot allocate new blocks

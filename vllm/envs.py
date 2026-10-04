@@ -326,6 +326,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_HYBRID_CACHE_SEGMENTED_REUSE: bool = False
+    VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE: bool = True
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -1177,6 +1178,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HYBRID_CACHE_SEGMENTED_REUSE": lambda: bool(
         int(os.getenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "0"))
+    ),
+    # Temporary ablation: keep checkpoint retention but skip segmented repair.
+    # Effective only when VLLM_HYBRID_CACHE_SEGMENTED_REUSE is enabled.
+    "VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_CACHE_SEGMENTED_RECOMPUTE", "1"))
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
