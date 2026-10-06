@@ -326,6 +326,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_HYBRID_CACHE_SEGMENTED_REUSE: bool = False
+    VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET: int = 0
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -1177,6 +1178,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HYBRID_CACHE_SEGMENTED_REUSE": lambda: bool(
         int(os.getenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "0"))
+    ),
+    # Experimental eviction budget for complete hybrid checkpoints. Requires
+    # segmented reuse; 0 preserves the original prototype's eviction policy.
+    "VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET": lambda: int(
+        os.getenv("VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET", "0")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

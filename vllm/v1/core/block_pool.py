@@ -157,6 +157,7 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        enable_eviction_skips: Honor per-block budgets when selecting victims.
     """
 
     def __init__(
@@ -166,10 +167,12 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_eviction_skips: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
+        self.enable_eviction_skips = enable_caching and enable_eviction_skips
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
@@ -660,7 +663,25 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.enable_eviction_skips:
+            ret: list[KVCacheBlock] = []
+            # Bound extra work to N rotations for N allocations. Budgets are
+            # best-effort protection, never a reason to reject an allocation.
+            skips_left = num_blocks
+            while len(ret) < num_blocks:
+                block = self.free_block_queue.popleft()
+                if (
+                    skips_left > 0
+                    and block.block_hash is not None
+                    and block.eviction_skip_budget > 0
+                ):
+                    block.eviction_skip_budget -= 1
+                    skips_left -= 1
+                    self.free_block_queue.append(block)
+                else:
+                    ret.append(block)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -689,6 +710,7 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        block.eviction_skip_budget = 0
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -722,20 +744,38 @@ class BlockPool:
         """Return whether a block can be mutated by its sole owner."""
         return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
-        """Free a list of blocks. The blocks should be ordered by their
-        eviction priority, where the first block will be evicted first.
+    def free_blocks(
+        self,
+        ordered_blocks: Iterable[KVCacheBlock],
+        *,
+        eviction_skip_budgets: dict[int, int] | None = None,
+    ) -> None:
+        """Free blocks in initial eviction order. Skip budgets may defer
+        cached blocks when they reach the head of the free queue.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            eviction_skip_budgets: Block ID to budget, assigned only when the
+                final reference is released. Unspecified blocks get zero.
         """
+        if eviction_skip_budgets and any(
+            budget < 0 for budget in eviction_skip_budgets.values()
+        ):
+            raise ValueError("Eviction skip budgets must be non-negative")
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                block.eviction_skip_budget = (
+                    eviction_skip_budgets.get(block.block_id, 0)
+                    if self.enable_eviction_skips
+                    and block.block_hash is not None
+                    and eviction_skip_budgets
+                    else 0
+                )
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)

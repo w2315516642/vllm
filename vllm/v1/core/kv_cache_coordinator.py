@@ -127,12 +127,22 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
+        skip_budget = envs.VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET
+        if skip_budget < 0:
+            raise ValueError("VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET must be >= 0")
+        self.checkpoint_skip_budget = (
+            skip_budget
+            if enable_caching and envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
+            else 0
+        )
+
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            enable_eviction_skips=self.checkpoint_skip_budget > 0,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -364,7 +374,11 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
         """
         if envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE:
-            self.block_pool.free_blocks(self.pop_blocks_in_eviction_order(request_id))
+            budgets: dict[int, int] = {}
+            blocks = self.pop_blocks_in_eviction_order(
+                request_id, eviction_skip_budgets=budgets
+            )
+            self.block_pool.free_blocks(blocks, eviction_skip_budgets=budgets)
         else:
             for manager in self.single_type_managers:
                 manager.free(request_id)
@@ -388,8 +402,13 @@ class KVCacheCoordinator(ABC):
             blocks.extend(manager.pop_blocks_for_free(request_id))
         return blocks
 
-    def pop_blocks_in_eviction_order(self, request_id: str) -> list[KVCacheBlock]:
-        """Pop blocks in the order they should enter the free queue."""
+    def pop_blocks_in_eviction_order(
+        self,
+        request_id: str,
+        *,
+        eviction_skip_budgets: dict[int, int] | None = None,
+    ) -> list[KVCacheBlock]:
+        """Pop blocks in eviction order, optionally collecting release budgets."""
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(reversed(manager.pop_blocks_for_free(request_id)))
@@ -985,7 +1004,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         return tuple(hit_blocks), tuple(hit_lengths)
 
-    def pop_blocks_in_eviction_order(self, request_id: str) -> list[KVCacheBlock]:
+    def pop_blocks_in_eviction_order(
+        self,
+        request_id: str,
+        *,
+        eviction_skip_budgets: dict[int, int] | None = None,
+    ) -> list[KVCacheBlock]:
         """Place FA segments ahead of the checkpoint needed to replay them."""
         fallback: list[KVCacheBlock] = []
         full_attention: list[tuple[int, KVCacheBlock]] = []
@@ -1034,6 +1058,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for _, block in checkpoints[boundary]
             )
             return fallback
+
+        if eviction_skip_budgets is not None and self.checkpoint_skip_budget:
+            eviction_skip_budgets.update(
+                (block.block_id, self.checkpoint_skip_budget)
+                for boundary in complete_boundaries
+                for _, block in checkpoints[boundary]
+            )
 
         full_attention.sort(key=lambda item: item[0])
         segments: list[list[KVCacheBlock]] = [
