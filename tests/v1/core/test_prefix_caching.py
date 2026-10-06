@@ -3,12 +3,10 @@
 """Compare the with and without prefix caching."""
 
 import copy
-from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 from math import lcm
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,6 +28,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
+from vllm.v1.core.kv_cache_coordinator import OrphanCheckpointEvictionPolicy
 from vllm.v1.core.kv_cache_manager import (
     KVCacheBlocks,
     KVCacheManager,
@@ -59,6 +58,198 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _make_orphan_checkpoint_pool():
+    pool = BlockPool(8, enable_caching=True, hash_block_size=16)
+    blocks = pool.get_new_blocks(7)
+    policy = OrphanCheckpointEvictionPolicy(pool, [0], [1, 2], fa_block_size=16)
+    pool.eviction_policy = policy
+    for block, prefix, group in (
+        (blocks[0], b"a", 0),
+        (blocks[1], b"a", 1),
+        (blocks[2], b"a", 2),
+        (blocks[3], b"b", 0),
+    ):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(prefix * 32), group),
+            block,
+            num_tokens=16,
+        )
+    return pool, policy, blocks
+
+
+@pytest.mark.parametrize("missing_group", [0, 2])
+def test_orphan_checkpoint_reclaims_only_after_dependency_loss(missing_group):
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
+    pool.evict_blocks({blocks[missing_group].block_id})
+    assert pool.get_new_blocks(1) == [blocks[1]]
+    assert blocks[3].block_hash is not None
+    assert policy.selected_blocks == 1
+    assert pool.num_eviction_reorders == 1
+
+
+def test_orphan_checkpoint_preserves_lru_for_valid_entries():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert policy.selected_blocks == 0
+
+
+def test_orphan_checkpoint_observes_evictions_in_same_allocation_batch():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[0], blocks[3], blocks[1], blocks[2]])
+    assert pool.get_new_blocks(3) == [blocks[0], blocks[1], blocks[2]]
+    assert blocks[3].block_hash is not None
+    assert policy.selected_blocks == 2
+    assert pool.num_eviction_reorders == 2
+    assert pool.free_block_queue.get_all_free_blocks() == [blocks[3]]
+
+
+def test_orphan_checkpoint_does_not_count_existing_order_as_reordering():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[0], blocks[1], blocks[2], blocks[3]])
+    assert pool.get_new_blocks(3) == blocks[:3]
+    assert policy.selected_blocks == 2
+    assert pool.num_eviction_reorders == 0
+
+
+def test_orphan_checkpoint_waits_for_final_release():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.touch([blocks[1]])
+    pool.free_blocks([blocks[1], blocks[3]])
+    pool.evict_blocks({blocks[0].block_id})
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert blocks[1].ref_cnt == 1
+    assert policy.selected_blocks == 0
+    pool.free_blocks([blocks[1]])
+    assert pool.get_new_blocks(1) == [blocks[1]]
+    assert policy.selected_blocks == 1
+
+
+def test_orphan_checkpoint_preserves_block_with_another_valid_alias():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    for group in (1, 2):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(b"b" * 32), group),
+            blocks[group],
+            num_tokens=16,
+        )
+    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
+    pool.evict_blocks({blocks[0].block_id})
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert policy.selected_blocks == 0
+
+
+def test_orphan_checkpoint_keeps_interior_boundaries_on_lru():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    # A longer FA block can satisfy the native downward-closed lookup without
+    # a hash at this interior boundary. Its absence is not evidence of loss.
+    policy.fa_block_size = 32
+    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
+    pool.evict_blocks({blocks[0].block_id})
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert policy.selected_blocks == 0
+
+
+def test_orphan_checkpoint_keeps_unknown_alias_lengths_on_lru():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    for group in (1, 2):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(b"c" * 32), group),
+            blocks[group],
+            num_tokens=8,
+        )
+    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
+    pool.evict_blocks({blocks[0].block_id})
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert policy.selected_blocks == 0
+
+
+@pytest.mark.parametrize("replacement", ["duplicate", "move", "reinsert"])
+def test_orphan_checkpoint_checks_live_hashes_after_fa_replacement(replacement):
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
+    key = make_block_hash_with_group_id(BlockHash(b"a" * 32), 0)
+    if replacement == "move":
+        pool.move_block_hashes(blocks[0], blocks[4])
+    else:
+        if replacement == "reinsert":
+            pool.evict_blocks({blocks[0].block_id})
+        pool._insert_block_hash(key, blocks[4], num_tokens=16)
+        if replacement == "duplicate":
+            pool.evict_blocks({blocks[0].block_id})
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert policy.selected_blocks == 0
+
+
+def test_orphan_checkpoint_uses_uncached_blocks_before_cached_candidates():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[3], blocks[1], blocks[2], blocks[4]])
+    pool.evict_blocks({blocks[0].block_id})
+    before = pool.free_block_queue.get_all_free_blocks()
+    with pytest.raises(ValueError):
+        pool.get_new_blocks(len(before) + 1)
+    assert pool.free_block_queue.get_all_free_blocks() == before
+    assert pool.get_new_blocks(2) == [blocks[4], blocks[1]]
+    assert policy.selected_blocks == 1
+
+
+def test_orphan_checkpoint_does_not_follow_recycled_block_ids():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks([blocks[1], blocks[3]])
+    pool.evict_blocks({blocks[0].block_id})
+    recycled = pool.get_new_blocks(1)[0]
+    assert recycled is blocks[1]
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(BlockHash(b"c" * 32), 0),
+        recycled,
+        num_tokens=16,
+    )
+    pool.free_blocks([recycled])
+    assert pool.get_new_blocks(1) == [blocks[3]]
+    assert recycled.block_hash is not None
+    assert policy.selected_blocks == 1
+
+
+def test_orphan_checkpoint_reset_clears_pending_work():
+    pool, policy, blocks = _make_orphan_checkpoint_pool()
+    pool.free_blocks(blocks)
+    assert policy.pending
+    assert pool.reset_prefix_cache()
+    assert not policy.pending and not policy.pending_set
+    assert policy.selected_blocks == 0
+    assert pool.num_eviction_reorders == 0
+    assert len(pool.get_new_blocks(7)) == 7
+
+
+@pytest.mark.parametrize(
+    "master,enabled,caching",
+    [(True, True, True), (True, False, True), (False, True, True), (True, True, False)],
+)
+def test_orphan_checkpoint_configuration_gate(monkeypatch, master, enabled, caching):
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", str(int(master)))
+    monkeypatch.setenv("VLLM_HYBRID_CACHE_ORPHAN_EVICTION", str(int(enabled)))
+    config = make_kv_cache_config_hybrid_model(4, 32, 1, second_spec_type="mamba")
+    config = replace(
+        config,
+        kv_cache_groups=[
+            replace(
+                group,
+                kv_cache_spec=replace(group.kv_cache_spec, mamba_cache_mode="align"),
+            )
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            else group
+            for group in config.kv_cache_groups
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config, max_model_len=128, enable_caching=caching, hash_block_size=4
+    )
+    assert isinstance(
+        manager.block_pool.eviction_policy, OrphanCheckpointEvictionPolicy
+    ) == (master and enabled and caching)
 
 
 @pytest.fixture(autouse=True)
@@ -2094,131 +2285,6 @@ def test_prefix_cache_stats_disabled():
 
     # Ensure prefix_cache_stats remains None
     assert manager.prefix_cache_stats is None
-
-
-def _make_eviction_skip_pool(num_blocks=2, enabled=True):
-    pool = BlockPool(
-        num_gpu_blocks=num_blocks + 1,
-        enable_caching=True,
-        hash_block_size=16,
-        enable_eviction_skips=enabled,
-    )
-    blocks = pool.get_new_blocks(num_blocks)
-    for block in blocks:
-        pool._insert_block_hash(
-            make_block_hash_with_group_id(BlockHash(str(block.block_id).encode()), 0),
-            block,
-            num_tokens=16,
-        )
-    return pool, blocks
-
-
-@pytest.mark.parametrize(
-    "budget, enabled", [(0, True), (1, True), (2, True), (2, False)]
-)
-def test_eviction_skip_budget_is_spent_without_refresh(budget, enabled):
-    """Rotating an old cached block must not refresh its release-time budget."""
-    pool, (protected, other) = _make_eviction_skip_pool(enabled=enabled)
-    other_hash = other.block_hash
-    pool.free_blocks([protected], eviction_skip_budgets={protected.block_id: budget})
-    # A later request releases a cached block behind the protected one.
-    pool.free_blocks([other])
-    for remaining in reversed(range(budget if enabled else 0)):
-        assert pool.get_new_blocks(1) == [other]
-        assert protected.eviction_skip_budget == remaining
-        assert protected.ref_cnt == 0
-        assert pool.cached_block_hash_to_block.contain(
-            protected.block_hash, protected.block_id
-        )
-        pool._insert_block_hash(other_hash, other, num_tokens=16)
-        pool.free_blocks([other])
-    assert pool.get_new_blocks(1) == [protected]
-    assert protected.eviction_skip_budget == 0
-    assert protected.block_hash is None
-
-
-def test_eviction_skip_budget_bounds_work_under_pressure():
-    """All blocks can be protected without stalling or failing allocation."""
-    pool, blocks = _make_eviction_skip_pool(num_blocks=3)
-    pool.free_blocks(blocks, eviction_skip_budgets={b.block_id: 100 for b in blocks})
-    queue = pool.free_block_queue
-    with patch.object(queue, "popleft", wraps=queue.popleft) as pop:
-        allocated = pool.get_new_blocks(2)
-    assert allocated == [blocks[2], blocks[0]]
-    assert pop.call_count == 4  # Two victims plus at most two skips.
-    assert blocks[1].eviction_skip_budget == 99
-    assert all(b.eviction_skip_budget == 0 and b.ref_cnt == 1 for b in allocated)
-    assert pool.get_new_blocks(1) == [blocks[1]]
-    assert pool.get_num_free_blocks() == 0
-
-
-def test_eviction_skip_budget_follows_final_release_and_reuse():
-    """Shared refs cannot enqueue early; a new release replaces the old budget."""
-    pool, (protected, uncached) = _make_eviction_skip_pool()
-    pool.evict_blocks({uncached.block_id})
-    pool.touch([protected])
-    pool.free_blocks([protected], eviction_skip_budgets={protected.block_id: 2})
-    assert protected.ref_cnt == 1
-    assert protected.eviction_skip_budget == 0
-    assert pool.get_num_free_blocks() == 0
-    pool.free_blocks(
-        [protected, uncached],
-        eviction_skip_budgets={protected.block_id: 1, uncached.block_id: 2},
-    )
-    assert protected.eviction_skip_budget == 1
-    assert uncached.eviction_skip_budget == 0
-    assert pool.get_new_blocks(1) == [uncached]
-    pool.touch([protected])
-    pool.free_blocks([protected], eviction_skip_budgets={protected.block_id: 2})
-    assert protected.eviction_skip_budget == 2
-    pool.touch([protected])
-    pool.free_blocks([protected])
-    assert protected.eviction_skip_budget == 0
-    assert pool.get_new_blocks(1) == [protected]
-
-
-@pytest.mark.parametrize("reset_all", [False, True])
-def test_eviction_skip_budget_cleared_on_invalidation(reset_all):
-    pool, blocks = _make_eviction_skip_pool()
-    pool.free_blocks(blocks, eviction_skip_budgets={b.block_id: 2 for b in blocks})
-    if reset_all:
-        assert pool.reset_prefix_cache()
-    else:
-        pool.evict_blocks({b.block_id for b in blocks})
-    assert all(b.eviction_skip_budget == 0 and b.block_hash is None for b in blocks)
-    assert pool.get_new_blocks(2) == blocks
-
-
-def test_deferred_release_carries_eviction_skip_budget_until_fence():
-    """No budget assignment or free-queue insertion while a GPU write is pending."""
-    pool, blocks = _make_eviction_skip_pool()
-
-    def pop(request, *, eviction_skip_budgets):
-        eviction_skip_budgets[blocks[0].block_id] = 2
-        return blocks
-
-    scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            block_pool=pool,
-            pop_blocks_in_eviction_order=pop,
-            release_segmented_recompute=lambda *a, **kw: None,
-        ),
-        deferred_frees=deque(),
-        defer_block_free=True,
-        sched_step_seq=3,
-        processed_step_seq=1,
-    )
-    request = SimpleNamespace(request_id="request", last_sched_seq=2)
-    Scheduler._free_request_blocks(scheduler, request)
-    Scheduler._drain_deferred_frees(scheduler)
-    assert pool.get_num_free_blocks() == 0
-    assert all(b.ref_cnt == 1 and b.eviction_skip_budget == 0 for b in blocks)
-    scheduler.processed_step_seq = 3
-    Scheduler._drain_deferred_frees(scheduler)
-    assert not scheduler.deferred_frees
-    assert pool.get_num_free_blocks() == 2
-    assert blocks[0].eviction_skip_budget == 2
-    assert pool.get_new_blocks(1) == [blocks[1]]
 
 
 def test_maybe_evict_cached_block():
@@ -4382,13 +4448,11 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
 
 
 @pytest.mark.parametrize("deferred_free", [False, True])
-@pytest.mark.parametrize("skip_budget", [0, 1])
 def test_request_free_refreshes_latest_mamba_checkpoint_after_fa(
-    monkeypatch: pytest.MonkeyPatch, deferred_free: bool, skip_budget: int
+    monkeypatch: pytest.MonkeyPatch, deferred_free: bool
 ):
     """Head-first release makes the latest GDN state newer than its FA KV."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
-    monkeypatch.setenv("VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET", str(skip_budget))
     block_size = 4
     manager = make_kv_cache_manager(
         kv_cache_config=KVCacheConfig(
@@ -4449,14 +4513,10 @@ def test_request_free_refreshes_latest_mamba_checkpoint_after_fa(
     pool.free_blocks(pressure)
 
     if deferred_free:
-        budgets: dict[int, int] = {}
-        blocks = manager.coordinator.pop_blocks_in_eviction_order(
-            "request", eviction_skip_budgets=budgets
-        )
+        blocks = manager.coordinator.pop_blocks_in_eviction_order("request")
         assert blocks[-1] is checkpoint
         assert checkpoint.ref_cnt == 1
-        assert checkpoint.eviction_skip_budget == 0
-        pool.free_blocks(blocks, eviction_skip_budgets=budgets)
+        pool.free_blocks(blocks)
     else:
         manager.coordinator.free("request")
 
@@ -4467,8 +4527,6 @@ def test_request_free_refreshes_latest_mamba_checkpoint_after_fa(
         for block in full_blocks
     )
     assert checkpoint.ref_cnt == 0
-    assert checkpoint.eviction_skip_budget == skip_budget
-    assert all(block.eviction_skip_budget == 0 for block in full_blocks)
 
 
 def test_new_mamba_checkpoint_replaces_old_pin(monkeypatch: pytest.MonkeyPatch):
@@ -4637,14 +4695,11 @@ def test_segmented_reuse_preserves_non_align_mamba_release(
     assert all(block.ref_cnt == 0 for block in allocated)
 
 
-@pytest.mark.parametrize("skip_budget", [0, 1, 2])
 def test_hybrid_release_orders_fa_segments_before_right_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
-    skip_budget: int,
 ):
     """Each GDN checkpoint outlives the FA segment immediately to its left."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
-    monkeypatch.setenv("VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET", str(skip_budget))
     block_size = 4
     manager = make_kv_cache_manager(
         kv_cache_config=KVCacheConfig(
@@ -4707,13 +4762,7 @@ def test_hybrid_release_orders_fa_segments_before_right_checkpoint(
         pool.free_blocks([checkpoint])
     mamba_manager.req_to_blocks["request"] = pool.get_new_blocks(1)
 
-    budgets: dict[int, int] = {}
-    ordered = manager.coordinator.pop_blocks_in_eviction_order(
-        "request", eviction_skip_budgets=budgets
-    )
-    assert budgets == (
-        {block.block_id: skip_budget for block in checkpoints} if skip_budget else {}
-    )
+    ordered = manager.coordinator.pop_blocks_in_eviction_order("request")
     relevant_ids = {block.block_id for block in [*full_blocks, *checkpoints]}
     relevant_order = [block for block in ordered if block.block_id in relevant_ids]
 
@@ -4730,9 +4779,8 @@ def test_hybrid_release_orders_fa_segments_before_right_checkpoint(
         full_blocks[1],
         checkpoints[0],
     ]
-    pool.free_blocks(ordered, eviction_skip_budgets=budgets)
+    pool.free_blocks(ordered)
     assert all(block.ref_cnt == 0 for block in checkpoints)
-    assert all(block.eviction_skip_budget == skip_budget for block in checkpoints)
 
 
 def test_hybrid_release_requires_checkpoint_from_every_mamba_group(
@@ -4740,7 +4788,6 @@ def test_hybrid_release_requires_checkpoint_from_every_mamba_group(
 ):
     """An incomplete recurrent checkpoint cannot protect an FA segment."""
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
-    monkeypatch.setenv("VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET", "1")
     block_size = 4
     full_spec = FullAttentionSpec(
         block_size=block_size,
@@ -4807,17 +4854,10 @@ def test_hybrid_release_requires_checkpoint_from_every_mamba_group(
             checkpoints[manager_index, boundary_tokens] = checkpoint
         mamba_manager.req_to_blocks["request"] = pool.get_new_blocks(1)
 
-    budgets: dict[int, int] = {}
-    ordered = manager.coordinator.pop_blocks_in_eviction_order(
-        "request", eviction_skip_budgets=budgets
-    )
+    ordered = manager.coordinator.pop_blocks_in_eviction_order("request")
     position = {block.block_id: index for index, block in enumerate(ordered)}
     common_boundary = 2 * block_size
     incomplete_boundary = 3 * block_size
-    assert budgets == {
-        checkpoints[manager_index, common_boundary].block_id: 1
-        for manager_index in (1, 2)
-    }
 
     # The incomplete checkpoint is fallback state, while both states at the
     # common boundary are newer than all FA blocks on its left.

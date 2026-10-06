@@ -774,16 +774,9 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
-    def pop_blocks_in_eviction_order(
-        self,
-        request: Request,
-        *,
-        eviction_skip_budgets: dict[int, int] | None = None,
-    ) -> list[KVCacheBlock]:
+    def pop_blocks_in_eviction_order(self, request: Request) -> list[KVCacheBlock]:
         """Pop request blocks in cache-type-specific eviction order."""
-        return self.coordinator.pop_blocks_in_eviction_order(
-            request.request_id, eviction_skip_budgets=eviction_skip_budgets
-        )
+        return self.coordinator.pop_blocks_in_eviction_order(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

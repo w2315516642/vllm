@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -140,6 +140,14 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+class BlockEvictionPolicy(Protocol):
+    def on_cache_change(self, block_hashes: Iterable[BlockHashWithGroupId]) -> None: ...
+
+    def get_candidate(self) -> KVCacheBlock | None: ...
+
+    def reset(self) -> None: ...
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -157,7 +165,6 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
-        enable_eviction_skips: Honor per-block budgets when selecting victims.
     """
 
     def __init__(
@@ -167,12 +174,10 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        enable_eviction_skips: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
-        self.enable_eviction_skips = enable_caching and enable_eviction_skips
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
@@ -197,6 +202,19 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.eviction_policy: BlockEvictionPolicy | None = None
+        self.num_eviction_reorders = 0
+
+    def get_cached_hashes(
+        self, block: KVCacheBlock
+    ) -> tuple[BlockHashWithGroupId, ...]:
+        """Return every cache key currently owned by a physical block."""
+        if block.block_hash is None:
+            return ()
+        return (
+            block.block_hash,
+            *sorted(self.cached_block_hashes_by_block.get(block.block_id, ())),
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -592,6 +610,8 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        if self.eviction_policy is not None:
+            self.eviction_policy.on_cache_change(removed_hashes)
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -663,25 +683,37 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        if self.enable_eviction_skips:
-            ret: list[KVCacheBlock] = []
-            # Bound extra work to N rotations for N allocations. Budgets are
-            # best-effort protection, never a reason to reject an allocation.
-            skips_left = num_blocks
-            while len(ret) < num_blocks:
-                block = self.free_block_queue.popleft()
-                if (
-                    skips_left > 0
-                    and block.block_hash is not None
-                    and block.eviction_skip_budget > 0
-                ):
-                    block.eviction_skip_budget -= 1
-                    skips_left -= 1
-                    self.free_block_queue.append(block)
+        if self.eviction_policy is not None:
+            selected: list[KVCacheBlock] = []
+            for _ in range(num_blocks):
+                head = self.free_block_queue.fake_free_list_head.next_free_block
+                assert head is not None
+                candidate = (
+                    self.eviction_policy.get_candidate()
+                    if head.block_hash is not None
+                    else None
+                )
+                if candidate is None:
+                    block = self.free_block_queue.popleft()
                 else:
-                    ret.append(block)
-        else:
-            ret = self.free_block_queue.popleft_n(num_blocks)
+                    assert not candidate.is_null and candidate.ref_cnt == 0
+                    if candidate is not head:
+                        self.num_eviction_reorders += 1
+                        if self.num_eviction_reorders == 1:
+                            logger.info("Cache eviction policy reordered a free block")
+                    self.free_block_queue.remove(candidate)
+                    block = candidate
+                # Publish each eviction before selecting the next block: a
+                # dependency can disappear within this allocation batch.
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+                selected.append(block)
+            return selected
+
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -710,7 +742,6 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
-        block.eviction_skip_budget = 0
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -744,38 +775,20 @@ class BlockPool:
         """Return whether a block can be mutated by its sole owner."""
         return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
 
-    def free_blocks(
-        self,
-        ordered_blocks: Iterable[KVCacheBlock],
-        *,
-        eviction_skip_budgets: dict[int, int] | None = None,
-    ) -> None:
-        """Free blocks in initial eviction order. Skip budgets may defer
-        cached blocks when they reach the head of the free queue.
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """Free a list of blocks. The blocks should be ordered by their
+        eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
-            eviction_skip_budgets: Block ID to budget, assigned only when the
-                final reference is released. Unspecified blocks get zero.
         """
-        if eviction_skip_budgets and any(
-            budget < 0 for budget in eviction_skip_budgets.values()
-        ):
-            raise ValueError("Eviction skip budgets must be non-negative")
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                block.eviction_skip_budget = (
-                    eviction_skip_budgets.get(block.block_id, 0)
-                    if self.enable_eviction_skips
-                    and block.block_hash is not None
-                    and eviction_skip_budgets
-                    else 0
-                )
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
@@ -787,6 +800,12 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if self.eviction_policy is not None:
+            self.eviction_policy.on_cache_change(
+                key
+                for block in blocks_to_evict_last
+                for key in self.get_cached_hashes(block)
+            )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -828,6 +847,9 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        if self.eviction_policy is not None:
+            self.eviction_policy.reset()
+        self.num_eviction_reorders = 0
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

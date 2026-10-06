@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from bisect import bisect_left
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -13,8 +14,12 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashWithGroupId,
     KVCacheBlock,
     dcp_world_size_for_kv_cache_spec,
+    get_block_hash,
+    get_group_id,
+    make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -127,22 +132,12 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
-        skip_budget = envs.VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET
-        if skip_budget < 0:
-            raise ValueError("VLLM_HYBRID_CACHE_CHECKPOINT_SKIP_BUDGET must be >= 0")
-        self.checkpoint_skip_budget = (
-            skip_budget
-            if enable_caching and envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
-            else 0
-        )
-
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
-            enable_eviction_skips=self.checkpoint_skip_budget > 0,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -374,11 +369,7 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
         """
         if envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE:
-            budgets: dict[int, int] = {}
-            blocks = self.pop_blocks_in_eviction_order(
-                request_id, eviction_skip_budgets=budgets
-            )
-            self.block_pool.free_blocks(blocks, eviction_skip_budgets=budgets)
+            self.block_pool.free_blocks(self.pop_blocks_in_eviction_order(request_id))
         else:
             for manager in self.single_type_managers:
                 manager.free(request_id)
@@ -402,13 +393,8 @@ class KVCacheCoordinator(ABC):
             blocks.extend(manager.pop_blocks_for_free(request_id))
         return blocks
 
-    def pop_blocks_in_eviction_order(
-        self,
-        request_id: str,
-        *,
-        eviction_skip_budgets: dict[int, int] | None = None,
-    ) -> list[KVCacheBlock]:
-        """Pop blocks in eviction order, optionally collecting release budgets."""
+    def pop_blocks_in_eviction_order(self, request_id: str) -> list[KVCacheBlock]:
+        """Pop blocks in the order they should enter the free queue."""
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(reversed(manager.pop_blocks_for_free(request_id)))
@@ -618,6 +604,84 @@ class SpecGroup(NamedTuple):
     use_eagle: bool
 
 
+class OrphanCheckpointEvictionPolicy:
+    """Prefer idle checkpoints without any currently reusable cache alias."""
+
+    def __init__(
+        self,
+        block_pool: BlockPool,
+        fa_group_ids: list[int],
+        mamba_group_ids: list[int],
+        fa_block_size: int,
+    ) -> None:
+        self.block_pool = block_pool
+        self.fa_block_size = fa_block_size
+        self.mamba_group_ids = tuple(mamba_group_ids)
+        self.required_group_ids = (*fa_group_ids, *mamba_group_ids)
+        self.pending: deque[BlockHash] = deque()
+        self.pending_set: set[BlockHash] = set()
+        self.selected_blocks = 0
+
+    def on_cache_change(self, block_hashes: Iterable[BlockHashWithGroupId]) -> None:
+        for key in block_hashes:
+            if get_group_id(key) not in self.required_group_ids:
+                continue
+            prefix = get_block_hash(key)
+            if prefix not in self.pending_set:
+                self.pending_set.add(prefix)
+                self.pending.append(prefix)
+
+    def _is_orphan(self, block: KVCacheBlock) -> bool:
+        keys = self.block_pool.get_cached_hashes(block)
+        # Interior boundaries can also hit through a longer full FA block.
+        # Alias lengths are not recorded, so retain multi-key blocks on LRU.
+        if (
+            len(keys) != 1
+            or block.block_hash_num_tokens is None
+            or block.block_hash_num_tokens % self.fa_block_size != 0
+        ):
+            return False
+        for key in keys:
+            # Unknown aliases may serve another cache type; keep them on LRU.
+            if get_group_id(key) not in self.mamba_group_ids:
+                return False
+            if (
+                self.block_pool.get_cached_block(
+                    get_block_hash(key), list(self.required_group_ids)
+                )
+                is not None
+            ):
+                return False
+        return True
+
+    def get_candidate(self) -> KVCacheBlock | None:
+        cache = self.block_pool.cached_block_hash_to_block
+        while self.pending:
+            prefix = self.pending.popleft()
+            self.pending_set.remove(prefix)
+            for group_id in self.mamba_group_ids:
+                block = cache.get_one_block(
+                    make_block_hash_with_group_id(prefix, group_id)
+                )
+                if (
+                    block is not None
+                    and not block.is_null
+                    and block.ref_cnt == 0
+                    and block.prev_free_block is not None
+                    and block.next_free_block is not None
+                    and self._is_orphan(block)
+                ):
+                    self.selected_blocks += 1
+                    logger.debug("Orphan checkpoint eviction: block=%d", block.block_id)
+                    return block
+        return None
+
+    def reset(self) -> None:
+        self.pending.clear()
+        self.pending_set.clear()
+        self.selected_blocks = 0
+
+
 class HybridKVCacheCoordinator(KVCacheCoordinator):
     """
     KV cache coordinator for hybrid models with multiple KV cache types, and
@@ -724,6 +788,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        if (
+            enable_caching
+            and envs.VLLM_HYBRID_CACHE_SEGMENTED_REUSE
+            and envs.VLLM_HYBRID_CACHE_ORPHAN_EVICTION
+            and not use_eagle
+            and dcp_world_size == pcp_world_size == 1
+            and len(self.attention_groups) == 2
+        ):
+            full_group, mamba_group = self.attention_groups
+            if (
+                isinstance(full_group.spec, FullAttentionSpec)
+                and isinstance(mamba_group.spec, MambaSpec)
+                and mamba_group.spec.mamba_cache_mode == "align"
+            ):
+                self.block_pool.eviction_policy = OrphanCheckpointEvictionPolicy(
+                    self.block_pool,
+                    full_group.group_ids,
+                    mamba_group.group_ids,
+                    full_group.spec.block_size,
+                )
+                logger.info("Hybrid orphan checkpoint eviction enabled")
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -1004,12 +1089,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         return tuple(hit_blocks), tuple(hit_lengths)
 
-    def pop_blocks_in_eviction_order(
-        self,
-        request_id: str,
-        *,
-        eviction_skip_budgets: dict[int, int] | None = None,
-    ) -> list[KVCacheBlock]:
+    def pop_blocks_in_eviction_order(self, request_id: str) -> list[KVCacheBlock]:
         """Place FA segments ahead of the checkpoint needed to replay them."""
         fallback: list[KVCacheBlock] = []
         full_attention: list[tuple[int, KVCacheBlock]] = []
@@ -1058,13 +1138,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for _, block in checkpoints[boundary]
             )
             return fallback
-
-        if eviction_skip_budgets is not None and self.checkpoint_skip_budget:
-            eviction_skip_budgets.update(
-                (block.block_id, self.checkpoint_skip_budget)
-                for boundary in complete_boundaries
-                for _, block in checkpoints[boundary]
-            )
 
         full_attention.sort(key=lambda item: item[0])
         segments: list[list[KVCacheBlock]] = [
