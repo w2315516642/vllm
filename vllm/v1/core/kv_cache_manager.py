@@ -661,9 +661,7 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = (
-            num_blocks_to_allocate
-            + watermark_blocks
-            + num_evictable_retained_blocks
+            num_blocks_to_allocate + watermark_blocks + num_evictable_retained_blocks
         )
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
@@ -707,6 +705,16 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
+            if (
+                self.block_pool.slru is not None
+                and num_new_computed_tokens > 0
+                and segmented_state is None
+            ):
+                # Use only blocks actually attached to this request (excluding
+                # skipped windows). Repair re-entry also attaches freshly
+                # recomputed blocks, so conservatively omit its heat updates.
+                for blocks in self.coordinator.get_blocks(request.request_id):
+                    self.block_pool.record_cache_hit(blocks)
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,

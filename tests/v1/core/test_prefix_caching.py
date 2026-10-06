@@ -46,6 +46,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -80,6 +81,7 @@ def test_slru_reused_block_survives_new_entries(monkeypatch, policy):
     pool, blocks = _make_slru_pool(monkeypatch, policy=policy)
     pool.free_blocks(blocks)
     pool.touch([blocks[0]])
+    pool.record_cache_hit([blocks[0]])
     pool.free_blocks([blocks[0]])
     # Cold entries arrive after the hot entry's final release.
     recycled = pool.get_new_blocks(1)[0]
@@ -105,6 +107,7 @@ def test_slru_protected_capacity_demotes_old_hot_entries(monkeypatch):
     pool, blocks = _make_slru_pool(monkeypatch)
     pool.free_blocks(blocks)
     pool.touch(blocks[:4])
+    pool.record_cache_hit(blocks[:4])
     pool.free_blocks(blocks[:4])
     assert list(pool.slru.protected) == [b.block_id for b in blocks[1:4]]
     assert pool.slru.demotions == 1
@@ -116,8 +119,10 @@ def test_slru_protection_refreshes_on_access(monkeypatch):
     pool, blocks = _make_slru_pool(monkeypatch)
     pool.free_blocks(blocks)
     pool.touch(blocks[:3])
+    pool.record_cache_hit(blocks[:3])
     pool.free_blocks(blocks[:3])
     pool.touch([blocks[0], blocks[3]])
+    pool.record_cache_hit([blocks[0], blocks[3]])
     assert blocks[1].block_id not in pool.slru.protected
     assert blocks[0].block_id in pool.slru.protected
     assert blocks[1].block_id in pool.slru.probation
@@ -126,6 +131,7 @@ def test_slru_protection_refreshes_on_access(monkeypatch):
 def test_slru_shared_blocks_wait_for_final_release(monkeypatch):
     pool, blocks = _make_slru_pool(monkeypatch)
     pool.touch([blocks[0], pool.null_block])
+    pool.record_cache_hit([blocks[0], pool.null_block])
     pool.free_blocks(blocks)
     assert blocks[0].block_id not in pool.slru.protected_free
     assert pool.get_new_blocks(6) == blocks[1:]
@@ -151,6 +157,7 @@ def test_slru_invalidation_and_id_reuse_clear_protection(monkeypatch):
     pool, blocks = _make_slru_pool(monkeypatch)
     pool.free_blocks(blocks)
     pool.touch([blocks[0]])
+    pool.record_cache_hit([blocks[0]])
     pool.free_blocks([blocks[0]])
     pool.evict_blocks({blocks[0].block_id})
     assert blocks[0].block_id not in pool.slru.protected
@@ -169,6 +176,10 @@ def test_slru_cow_moves_protection_with_all_aliases(monkeypatch, idle_destinatio
     src, dst = blocks[:2]
     pool.free_blocks([src])
     pool.touch([src])
+    pool.record_cache_hit([src])
+    pool.touch(blocks[2:4])
+    pool.record_cache_hit(blocks[2:4])
+    promotions = pool.slru.promotions
     primary = src.block_hash
     alias = make_block_hash_with_group_id(BlockHash(b"z" * 32), 0)
     pool._insert_block_hash(alias, src, 32)
@@ -178,6 +189,11 @@ def test_slru_cow_moves_protection_with_all_aliases(monkeypatch, idle_destinatio
     pool.move_block_hashes(src, dst)
     assert src.block_id not in pool.slru.protected
     assert dst.block_id in pool.slru.protected
+    assert list(pool.slru.protected) == [
+        dst.block_id,
+        *[b.block_id for b in blocks[2:4]],
+    ]
+    assert pool.slru.promotions == promotions
     for key in (primary, alias):
         assert pool.cached_block_hash_to_block.get_one_block(key) is dst
     if not idle_destination:
@@ -192,6 +208,7 @@ def test_slru_reset_clears_segments_and_counters(monkeypatch):
     pool, blocks = _make_slru_pool(monkeypatch)
     pool.free_blocks(blocks)
     pool.touch(blocks[:4])
+    pool.record_cache_hit(blocks[:4])
     assert not pool.reset_prefix_cache()
     assert pool.slru.protected
     pool.free_blocks(blocks[:4])
@@ -208,6 +225,73 @@ def test_slru_disabled_without_prefix_caching(monkeypatch):
     assert pool.slru is None
     pool.free_blocks(blocks)
     assert pool.get_new_blocks(7) == blocks
+
+
+def test_slru_checkpoint_pin_is_not_a_cache_hit(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_HYBRID_CACHE_SEGMENTED_REUSE", True)
+    pool, blocks = _make_slru_pool(monkeypatch)
+    block = blocks[0]
+    manager = SimpleNamespace(
+        block_pool=pool,
+        mamba_cache_mode="align",
+        _latest_checkpoint_by_request={},
+        _retained_checkpoints_by_request={},
+        _shared_prefix_boundary_by_request={},
+    )
+    MambaManager._record_checkpoint(manager, "producer", block, pin=True)
+    assert block.ref_cnt == 2
+    assert not pool.slru.protected
+    assert pool.slru.promotions == 0
+    pool.free_blocks([block])
+    assert block.block_id not in pool.slru.probation
+    pool.free_blocks([block])
+    assert pool.get_new_blocks(1) == [block]
+
+
+def test_slru_internal_pin_does_not_refresh_protected_order(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.free_blocks(blocks)
+    pool.touch(blocks[:3])
+    pool.record_cache_hit(blocks[:3])
+    pool.free_blocks(blocks[:3])
+    pool.touch([blocks[0]])
+    assert blocks[0].block_id not in pool.slru.protected_free
+    pool.free_blocks([blocks[0]])
+    pool.touch([blocks[3]])
+    pool.record_cache_hit([blocks[3]])
+    assert blocks[0].block_id not in pool.slru.protected
+    assert pool.slru.promotions == 4
+
+
+def test_slru_only_admitted_prefix_hits_promote(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_PREFIX_CACHE_EVICTION_POLICY", "slru")
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    pool = manager.block_pool
+    common = [i for i in range(3) for _ in range(16)]
+    first = make_request("producer", common + [3] * 7, 16, sha256)
+    assert manager.allocate_slots(first, 55) is not None
+    manager.free(first)
+    assert pool.slru.promotions == 0
+    second = make_request("consumer", common + [4] * 5, 16, sha256)
+    computed, hit, _ = manager.get_computed_blocks(second)
+    assert hit == 48
+    assert pool.slru.promotions == 0
+    assert (
+        manager.allocate_slots(
+            second, 5, hit, computed, reserved_blocks=pool.get_num_free_blocks()
+        )
+        is None
+    )
+    assert pool.slru.promotions == 0
+    assert manager.allocate_slots(second, 5, hit, computed) is not None
+    assert pool.slru.promotions == 3
+    assert set(pool.slru.protected) == {b.block_id for b in computed.blocks[0]}
+    manager.free(second)
 
 
 @pytest.fixture(autouse=True)
@@ -5220,8 +5304,12 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
 
 
-def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
+@pytest.mark.parametrize("eviction_policy", ["lru", "slru"])
+def test_segmented_recompute_repairs_head_then_reuses_suffix(
+    monkeypatch, eviction_policy
+):
     """A repaired head makes a retained FA suffix and checkpoint reusable."""
+    monkeypatch.setattr(envs, "VLLM_PREFIX_CACHE_EVICTION_POLICY", eviction_policy)
     monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "1")
     block_size = 4
     manager = make_kv_cache_manager(
@@ -5287,6 +5375,8 @@ def test_segmented_recompute_repairs_head_then_reuses_suffix(monkeypatch):
     assert manager.get_segmented_recompute_state(request.request_id) is None
     assert all(block.ref_cnt >= 1 for block in suffix_blocks)
     manager.free(request)
+    if pool.slru is not None:
+        assert pool.slru.promotions == 0
 
 
 def test_segmented_recompute_accepts_partial_resume_boundary(monkeypatch):

@@ -146,8 +146,8 @@ class SLRUCachePolicy:
     """Bounded protected segment for reused blocks, independent of cache type.
 
     Only idle cached blocks are eviction candidates. New entries remain in
-    probation until touched. Protected capacity includes active entries, so
-    old hot entries can be demoted even while a request holds a reference.
+    probation until an admitted prefix hit. Protected capacity includes active
+    entries, so old hot entries can be demoted while a request holds a reference.
     Within each eligible segment, release order supplies recency, as in LRU.
     """
 
@@ -160,12 +160,16 @@ class SLRUCachePolicy:
         self.demotions = 0
         self.reorders = 0
 
-    def touch(self, block: KVCacheBlock) -> None:
+    def acquire(self, block: KVCacheBlock) -> None:
+        """Remove a referenced block from candidates without refreshing heat."""
+        self.probation.pop(block.block_id, None)
+        self.protected_free.pop(block.block_id, None)
+
+    def record_hit(self, block: KVCacheBlock) -> None:
         block_id = block.block_id
-        self.probation.pop(block_id, None)
-        self.protected_free.pop(block_id, None)
         if block.block_hash is None or block.is_null:
             return
+        assert block.ref_cnt > 0
         if block_id not in self.protected:
             self.promotions += 1
         self.protected[block_id] = block
@@ -176,6 +180,23 @@ class SLRUCachePolicy:
             if demoted.ref_cnt == 0:
                 self.probation[demoted_id] = demoted
             self.demotions += 1
+
+    def move(self, src: KVCacheBlock, dst: KVCacheBlock) -> None:
+        """Transfer protection on COW without counting or refreshing a hit."""
+        if src.block_id in self.protected:
+            # OrderedDict cannot replace a key in place. COW keeps the old
+            # position rather than turning a copy into a new cache access.
+            self.protected = OrderedDict(
+                (dst.block_id, dst) if key == src.block_id else (key, block)
+                for key, block in self.protected.items()
+            )
+            if src.block_id in self.protected_free and dst.ref_cnt == 0:
+                self.protected_free = OrderedDict(
+                    (dst.block_id, dst) if key == src.block_id else (key, block)
+                    for key, block in self.protected_free.items()
+                )
+        self.probation.pop(src.block_id, None)
+        self.protected_free.pop(src.block_id, None)
 
     def release(self, block: KVCacheBlock) -> None:
         segment = (
@@ -716,20 +737,12 @@ class BlockPool:
         """
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
-        was_protected = (
-            self.slru is not None and src_block.block_id in self.slru.protected
-        )
+        if self.slru is not None:
+            self.slru.move(src_block, dst_block)
         num_tokens = src_block.block_hash_num_tokens
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
-        if was_protected:
-            assert self.slru is not None
-            # The cached content moved; its protection must not follow the
-            # source block when that physical ID is reused for new content.
-            self.slru.touch(dst_block)
-            if dst_block.ref_cnt == 0:
-                self.slru.release(dst_block)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -809,8 +822,8 @@ class BlockPool:
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
-        the block from the free queue. This is used when a block is hit by
-        another request with the same prefix.
+        the block from the free queue. Prefix hits and internal retention
+        both use this operation; it does not update eviction-policy heat.
 
         Args:
             blocks: A list of blocks to touch.
@@ -822,9 +835,15 @@ class BlockPool:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.slru is not None:
-                self.slru.touch(block)
+                self.slru.acquire(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+
+    def record_cache_hit(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Record admitted prefix reuse after acquiring the blocks."""
+        if self.slru is not None:
+            for block in blocks:
+                self.slru.record_hit(block)
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         """Return whether a block can be mutated by its sole owner."""
