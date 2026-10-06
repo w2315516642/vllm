@@ -326,7 +326,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_HYBRID_CACHE_SEGMENTED_REUSE: bool = False
-    VLLM_HYBRID_CACHE_ORPHAN_EVICTION: bool = False
+    VLLM_PREFIX_CACHE_EVICTION_POLICY: str = "lru"
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -1176,12 +1176,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
     ),
+    # Experimental block-level eviction policy. SLRU bounds the protected
+    # segment to half the pool; no model-specific priority is used.
+    "VLLM_PREFIX_CACHE_EVICTION_POLICY": env_with_choices(
+        "VLLM_PREFIX_CACHE_EVICTION_POLICY", "lru", ["lru", "slru"]
+    ),
     "VLLM_HYBRID_CACHE_SEGMENTED_REUSE": lambda: bool(
         int(os.getenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", "0"))
-    ),
-    # Experimental FA/align-Mamba eviction policy; keep the prototype by default.
-    "VLLM_HYBRID_CACHE_ORPHAN_EVICTION": lambda: bool(
-        int(os.getenv("VLLM_HYBRID_CACHE_ORPHAN_EVICTION", "0"))
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

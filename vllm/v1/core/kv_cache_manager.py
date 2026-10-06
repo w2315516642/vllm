@@ -661,7 +661,9 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = (
-            num_blocks_to_allocate + watermark_blocks + num_evictable_retained_blocks
+            num_blocks_to_allocate
+            + watermark_blocks
+            + num_evictable_retained_blocks
         )
         if required_blocks > available_blocks:
             # Cannot allocate new blocks

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.v1.core.kv_cache_manager as kv_cache_manager
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.distributed.kv_events import (
@@ -28,7 +29,6 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
-from vllm.v1.core.kv_cache_coordinator import OrphanCheckpointEvictionPolicy
 from vllm.v1.core.kv_cache_manager import (
     KVCacheBlocks,
     KVCacheManager,
@@ -60,196 +60,154 @@ from vllm.v1.request import RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-def _make_orphan_checkpoint_pool():
-    pool = BlockPool(8, enable_caching=True, hash_block_size=16)
-    blocks = pool.get_new_blocks(7)
-    policy = OrphanCheckpointEvictionPolicy(pool, [0], [1, 2], fa_block_size=16)
-    pool.eviction_policy = policy
-    for block, prefix, group in (
-        (blocks[0], b"a", 0),
-        (blocks[1], b"a", 1),
-        (blocks[2], b"a", 2),
-        (blocks[3], b"b", 0),
-    ):
+def _make_slru_pool(monkeypatch, *, policy="slru", count=8, caching=True):
+    monkeypatch.setattr(envs, "VLLM_PREFIX_CACHE_EVICTION_POLICY", policy)
+    pool = BlockPool(count, enable_caching=caching, hash_block_size=16)
+    blocks = pool.get_new_blocks(count - 1)
+    for block in blocks:
         pool._insert_block_hash(
-            make_block_hash_with_group_id(BlockHash(prefix * 32), group),
+            make_block_hash_with_group_id(
+                BlockHash(block.block_id.to_bytes(32, "big")), 0
+            ),
             block,
             num_tokens=16,
         )
-    return pool, policy, blocks
+    return pool, blocks
 
 
-@pytest.mark.parametrize("missing_group", [0, 2])
-def test_orphan_checkpoint_reclaims_only_after_dependency_loss(missing_group):
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
-    pool.evict_blocks({blocks[missing_group].block_id})
-    assert pool.get_new_blocks(1) == [blocks[1]]
-    assert blocks[3].block_hash is not None
-    assert policy.selected_blocks == 1
-    assert pool.num_eviction_reorders == 1
-
-
-def test_orphan_checkpoint_preserves_lru_for_valid_entries():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert policy.selected_blocks == 0
-
-
-def test_orphan_checkpoint_observes_evictions_in_same_allocation_batch():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[0], blocks[3], blocks[1], blocks[2]])
-    assert pool.get_new_blocks(3) == [blocks[0], blocks[1], blocks[2]]
-    assert blocks[3].block_hash is not None
-    assert policy.selected_blocks == 2
-    assert pool.num_eviction_reorders == 2
-    assert pool.free_block_queue.get_all_free_blocks() == [blocks[3]]
-
-
-def test_orphan_checkpoint_does_not_count_existing_order_as_reordering():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[0], blocks[1], blocks[2], blocks[3]])
-    assert pool.get_new_blocks(3) == blocks[:3]
-    assert policy.selected_blocks == 2
-    assert pool.num_eviction_reorders == 0
-
-
-def test_orphan_checkpoint_waits_for_final_release():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.touch([blocks[1]])
-    pool.free_blocks([blocks[1], blocks[3]])
-    pool.evict_blocks({blocks[0].block_id})
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert blocks[1].ref_cnt == 1
-    assert policy.selected_blocks == 0
-    pool.free_blocks([blocks[1]])
-    assert pool.get_new_blocks(1) == [blocks[1]]
-    assert policy.selected_blocks == 1
-
-
-def test_orphan_checkpoint_preserves_block_with_another_valid_alias():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    for group in (1, 2):
-        pool._insert_block_hash(
-            make_block_hash_with_group_id(BlockHash(b"b" * 32), group),
-            blocks[group],
-            num_tokens=16,
-        )
-    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
-    pool.evict_blocks({blocks[0].block_id})
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert policy.selected_blocks == 0
-
-
-def test_orphan_checkpoint_keeps_interior_boundaries_on_lru():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    # A longer FA block can satisfy the native downward-closed lookup without
-    # a hash at this interior boundary. Its absence is not evidence of loss.
-    policy.fa_block_size = 32
-    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
-    pool.evict_blocks({blocks[0].block_id})
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert policy.selected_blocks == 0
-
-
-def test_orphan_checkpoint_keeps_unknown_alias_lengths_on_lru():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    for group in (1, 2):
-        pool._insert_block_hash(
-            make_block_hash_with_group_id(BlockHash(b"c" * 32), group),
-            blocks[group],
-            num_tokens=8,
-        )
-    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
-    pool.evict_blocks({blocks[0].block_id})
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert policy.selected_blocks == 0
-
-
-@pytest.mark.parametrize("replacement", ["duplicate", "move", "reinsert"])
-def test_orphan_checkpoint_checks_live_hashes_after_fa_replacement(replacement):
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[3], blocks[1], blocks[2]])
-    key = make_block_hash_with_group_id(BlockHash(b"a" * 32), 0)
-    if replacement == "move":
-        pool.move_block_hashes(blocks[0], blocks[4])
-    else:
-        if replacement == "reinsert":
-            pool.evict_blocks({blocks[0].block_id})
-        pool._insert_block_hash(key, blocks[4], num_tokens=16)
-        if replacement == "duplicate":
-            pool.evict_blocks({blocks[0].block_id})
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert policy.selected_blocks == 0
-
-
-def test_orphan_checkpoint_uses_uncached_blocks_before_cached_candidates():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[3], blocks[1], blocks[2], blocks[4]])
-    pool.evict_blocks({blocks[0].block_id})
-    before = pool.free_block_queue.get_all_free_blocks()
-    with pytest.raises(ValueError):
-        pool.get_new_blocks(len(before) + 1)
-    assert pool.free_block_queue.get_all_free_blocks() == before
-    assert pool.get_new_blocks(2) == [blocks[4], blocks[1]]
-    assert policy.selected_blocks == 1
-
-
-def test_orphan_checkpoint_does_not_follow_recycled_block_ids():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
-    pool.free_blocks([blocks[1], blocks[3]])
-    pool.evict_blocks({blocks[0].block_id})
+@pytest.mark.parametrize("policy", ["lru", "slru"])
+def test_slru_reused_block_survives_new_entries(monkeypatch, policy):
+    pool, blocks = _make_slru_pool(monkeypatch, policy=policy)
+    pool.free_blocks(blocks)
+    pool.touch([blocks[0]])
+    pool.free_blocks([blocks[0]])
+    # Cold entries arrive after the hot entry's final release.
     recycled = pool.get_new_blocks(1)[0]
-    assert recycled is blocks[1]
     pool._insert_block_hash(
-        make_block_hash_with_group_id(BlockHash(b"c" * 32), 0),
-        recycled,
-        num_tokens=16,
+        make_block_hash_with_group_id(BlockHash(b"z" * 32), 0), recycled, 16
     )
     pool.free_blocks([recycled])
-    assert pool.get_new_blocks(1) == [blocks[3]]
-    assert recycled.block_hash is not None
-    assert policy.selected_blocks == 1
+    assert pool.get_new_blocks(5) == blocks[2:]
+    expected = recycled if policy == "slru" else blocks[0]
+    assert pool.get_new_blocks(1) == [expected]
+    if pool.slru is not None:
+        assert pool.slru.reorders == 1
 
 
-def test_orphan_checkpoint_reset_clears_pending_work():
-    pool, policy, blocks = _make_orphan_checkpoint_pool()
+def test_slru_without_reuse_keeps_release_order(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.free_blocks(list(reversed(blocks)))
+    assert pool.get_new_blocks(len(blocks)) == list(reversed(blocks))
+    assert pool.slru.reorders == 0
+
+
+def test_slru_protected_capacity_demotes_old_hot_entries(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
     pool.free_blocks(blocks)
-    assert policy.pending
+    pool.touch(blocks[:4])
+    pool.free_blocks(blocks[:4])
+    assert list(pool.slru.protected) == [b.block_id for b in blocks[1:4]]
+    assert pool.slru.demotions == 1
+    # The demoted active block only becomes eligible on its final release.
+    assert pool.get_new_blocks(4) == [*blocks[4:], blocks[0]]
+
+
+def test_slru_protection_refreshes_on_access(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.free_blocks(blocks)
+    pool.touch(blocks[:3])
+    pool.free_blocks(blocks[:3])
+    pool.touch([blocks[0], blocks[3]])
+    assert blocks[1].block_id not in pool.slru.protected
+    assert blocks[0].block_id in pool.slru.protected
+    assert blocks[1].block_id in pool.slru.probation
+
+
+def test_slru_shared_blocks_wait_for_final_release(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.touch([blocks[0], pool.null_block])
+    pool.free_blocks(blocks)
+    assert blocks[0].block_id not in pool.slru.protected_free
+    assert pool.get_new_blocks(6) == blocks[1:]
+    pool.free_blocks([blocks[0], pool.null_block])
+    assert pool.get_new_blocks(1) == [blocks[0]]
+    assert pool.null_block.block_id not in pool.slru.protected
+
+
+def test_slru_unused_blocks_and_failed_allocation(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.evict_blocks({blocks[-1].block_id})
+    pool.free_blocks(blocks)
+    before = pool.free_block_queue.get_all_free_blocks()
+    with pytest.raises(ValueError):
+        pool.get_new_blocks(8)
+    assert pool.free_block_queue.get_all_free_blocks() == before
+    assert pool.get_new_blocks(0) == []
+    assert pool.get_new_blocks(1) == [blocks[-1]]
+    assert pool.get_new_blocks(1) == [blocks[0]]
+
+
+def test_slru_invalidation_and_id_reuse_clear_protection(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.free_blocks(blocks)
+    pool.touch([blocks[0]])
+    pool.free_blocks([blocks[0]])
+    pool.evict_blocks({blocks[0].block_id})
+    assert blocks[0].block_id not in pool.slru.protected
+    # Install a new identity on the same free physical block.
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(BlockHash(b"z" * 32), 0), blocks[0], 16
+    )
+    assert blocks[0].block_id in pool.slru.probation
+    assert pool.get_new_blocks(7) == [*blocks[1:], blocks[0]]
+    assert not pool.slru.probation and not pool.slru.protected
+
+
+@pytest.mark.parametrize("idle_destination", [False, True])
+def test_slru_cow_moves_protection_with_all_aliases(monkeypatch, idle_destination):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    src, dst = blocks[:2]
+    pool.free_blocks([src])
+    pool.touch([src])
+    primary = src.block_hash
+    alias = make_block_hash_with_group_id(BlockHash(b"z" * 32), 0)
+    pool._insert_block_hash(alias, src, 32)
+    pool.evict_blocks({dst.block_id})
+    if idle_destination:
+        pool.free_blocks([dst])
+    pool.move_block_hashes(src, dst)
+    assert src.block_id not in pool.slru.protected
+    assert dst.block_id in pool.slru.protected
+    for key in (primary, alias):
+        assert pool.cached_block_hash_to_block.get_one_block(key) is dst
+    if not idle_destination:
+        pool.free_blocks([dst])
+    assert dst.block_id in pool.slru.protected_free
+    pool.free_blocks([src])
+    assert pool.get_new_blocks(1) == [src]
+    assert pool.get_new_blocks(1) == [dst]
+
+
+def test_slru_reset_clears_segments_and_counters(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch)
+    pool.free_blocks(blocks)
+    pool.touch(blocks[:4])
+    assert not pool.reset_prefix_cache()
+    assert pool.slru.protected
+    pool.free_blocks(blocks[:4])
     assert pool.reset_prefix_cache()
-    assert not policy.pending and not policy.pending_set
-    assert policy.selected_blocks == 0
-    assert pool.num_eviction_reorders == 0
+    assert not pool.slru.probation
+    assert not pool.slru.protected
+    assert not pool.slru.protected_free
+    assert pool.slru.promotions == pool.slru.demotions == pool.slru.reorders == 0
     assert len(pool.get_new_blocks(7)) == 7
 
 
-@pytest.mark.parametrize(
-    "master,enabled,caching",
-    [(True, True, True), (True, False, True), (False, True, True), (True, True, False)],
-)
-def test_orphan_checkpoint_configuration_gate(monkeypatch, master, enabled, caching):
-    monkeypatch.setenv("VLLM_HYBRID_CACHE_SEGMENTED_REUSE", str(int(master)))
-    monkeypatch.setenv("VLLM_HYBRID_CACHE_ORPHAN_EVICTION", str(int(enabled)))
-    config = make_kv_cache_config_hybrid_model(4, 32, 1, second_spec_type="mamba")
-    config = replace(
-        config,
-        kv_cache_groups=[
-            replace(
-                group,
-                kv_cache_spec=replace(group.kv_cache_spec, mamba_cache_mode="align"),
-            )
-            if isinstance(group.kv_cache_spec, MambaSpec)
-            else group
-            for group in config.kv_cache_groups
-        ],
-    )
-    manager = make_kv_cache_manager(
-        config, max_model_len=128, enable_caching=caching, hash_block_size=4
-    )
-    assert isinstance(
-        manager.block_pool.eviction_policy, OrphanCheckpointEvictionPolicy
-    ) == (master and enabled and caching)
+def test_slru_disabled_without_prefix_caching(monkeypatch):
+    pool, blocks = _make_slru_pool(monkeypatch, caching=False)
+    assert pool.slru is None
+    pool.free_blocks(blocks)
+    assert pool.get_new_blocks(7) == blocks
 
 
 @pytest.fixture(autouse=True)

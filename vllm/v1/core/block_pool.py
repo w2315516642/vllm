@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
-from typing import Any, Protocol
+from typing import Any
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -140,12 +142,63 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
-class BlockEvictionPolicy(Protocol):
-    def on_cache_change(self, block_hashes: Iterable[BlockHashWithGroupId]) -> None: ...
+class SLRUCachePolicy:
+    """Bounded protected segment for reused blocks, independent of cache type.
 
-    def get_candidate(self) -> KVCacheBlock | None: ...
+    Only idle cached blocks are eviction candidates. New entries remain in
+    probation until touched. Protected capacity includes active entries, so
+    old hot entries can be demoted even while a request holds a reference.
+    Within each eligible segment, release order supplies recency, as in LRU.
+    """
 
-    def reset(self) -> None: ...
+    def __init__(self, protected_capacity: int) -> None:
+        self.protected_capacity = protected_capacity
+        self.probation: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self.protected: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self.protected_free: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self.promotions = 0
+        self.demotions = 0
+        self.reorders = 0
+
+    def touch(self, block: KVCacheBlock) -> None:
+        block_id = block.block_id
+        self.probation.pop(block_id, None)
+        self.protected_free.pop(block_id, None)
+        if block.block_hash is None or block.is_null:
+            return
+        if block_id not in self.protected:
+            self.promotions += 1
+        self.protected[block_id] = block
+        self.protected.move_to_end(block_id)
+        while len(self.protected) > self.protected_capacity:
+            demoted_id, demoted = self.protected.popitem(last=False)
+            self.protected_free.pop(demoted_id, None)
+            if demoted.ref_cnt == 0:
+                self.probation[demoted_id] = demoted
+            self.demotions += 1
+
+    def release(self, block: KVCacheBlock) -> None:
+        segment = (
+            self.protected_free if block.block_id in self.protected else self.probation
+        )
+        segment.setdefault(block.block_id, block)
+
+    def forget(self, block: KVCacheBlock) -> None:
+        self.probation.pop(block.block_id, None)
+        self.protected.pop(block.block_id, None)
+        self.protected_free.pop(block.block_id, None)
+
+    def pop_candidate(self) -> KVCacheBlock | None:
+        segment = self.probation or self.protected_free
+        if not segment:
+            return None
+        return segment.popitem(last=False)[1]
+
+    def reset(self) -> None:
+        self.probation.clear()
+        self.protected.clear()
+        self.protected_free.clear()
+        self.promotions = self.demotions = self.reorders = 0
 
 
 class BlockPool:
@@ -202,19 +255,16 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
-        self.eviction_policy: BlockEvictionPolicy | None = None
-        self.num_eviction_reorders = 0
-
-    def get_cached_hashes(
-        self, block: KVCacheBlock
-    ) -> tuple[BlockHashWithGroupId, ...]:
-        """Return every cache key currently owned by a physical block."""
-        if block.block_hash is None:
-            return ()
-        return (
-            block.block_hash,
-            *sorted(self.cached_block_hashes_by_block.get(block.block_id, ())),
+        self.slru = (
+            SLRUCachePolicy((num_gpu_blocks - 1) // 2)
+            if enable_caching and envs.VLLM_PREFIX_CACHE_EVICTION_POLICY == "slru"
+            else None
         )
+        if self.slru is not None:
+            logger.info(
+                "SLRU eviction enabled: protected_capacity=%d blocks",
+                self.slru.protected_capacity,
+            )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -595,6 +645,8 @@ class BlockPool:
         self,
         block: KVCacheBlock,
     ) -> list[BlockHashWithGroupId]:
+        if self.slru is not None:
+            self.slru.forget(block)
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
@@ -610,8 +662,6 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
-        if self.eviction_policy is not None:
-            self.eviction_policy.on_cache_change(removed_hashes)
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -650,6 +700,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if self.slru is not None and block.ref_cnt == 0 and not block.is_null:
+            self.slru.release(block)
 
     def move_block_hashes(
         self,
@@ -664,10 +716,20 @@ class BlockPool:
         """
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
+        was_protected = (
+            self.slru is not None and src_block.block_id in self.slru.protected
+        )
         num_tokens = src_block.block_hash_num_tokens
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        if was_protected:
+            assert self.slru is not None
+            # The cached content moved; its protection must not follow the
+            # source block when that physical ID is reused for new content.
+            self.slru.touch(dst_block)
+            if dst_block.ref_cnt == 0:
+                self.slru.release(dst_block)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -683,37 +745,28 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        if self.eviction_policy is not None:
-            selected: list[KVCacheBlock] = []
+        if self.slru is None:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            ret = []
             for _ in range(num_blocks):
                 head = self.free_block_queue.fake_free_list_head.next_free_block
                 assert head is not None
                 candidate = (
-                    self.eviction_policy.get_candidate()
-                    if head.block_hash is not None
-                    else None
+                    self.slru.pop_candidate() if head.block_hash is not None else None
                 )
                 if candidate is None:
                     block = self.free_block_queue.popleft()
                 else:
-                    assert not candidate.is_null and candidate.ref_cnt == 0
+                    assert candidate.ref_cnt == 0 and not candidate.is_null
                     if candidate is not head:
-                        self.num_eviction_reorders += 1
-                        if self.num_eviction_reorders == 1:
-                            logger.info("Cache eviction policy reordered a free block")
+                        self.slru.reorders += 1
+                        if self.slru.reorders == 1:
+                            logger.info("SLRU changed eviction order")
                     self.free_block_queue.remove(candidate)
                     block = candidate
-                # Publish each eviction before selecting the next block: a
-                # dependency can disappear within this allocation batch.
-                self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
-                selected.append(block)
-            return selected
-
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+                self.slru.forget(block)
+                ret.append(block)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -768,6 +821,8 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if self.slru is not None:
+                self.slru.touch(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -800,12 +855,9 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
-        if self.eviction_policy is not None:
-            self.eviction_policy.on_cache_change(
-                key
-                for block in blocks_to_evict_last
-                for key in self.get_cached_hashes(block)
-            )
+        if self.slru is not None:
+            for block in blocks_to_evict_last:
+                self.slru.release(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -847,9 +899,8 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
-        if self.eviction_policy is not None:
-            self.eviction_policy.reset()
-        self.num_eviction_reorders = 0
+        if self.slru is not None:
+            self.slru.reset()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
