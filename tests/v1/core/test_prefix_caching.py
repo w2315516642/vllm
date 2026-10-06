@@ -228,7 +228,9 @@ def test_slru_disabled_without_prefix_caching(monkeypatch):
 
 
 def test_slru_checkpoint_pin_is_not_a_cache_hit(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_HYBRID_CACHE_SEGMENTED_REUSE", True)
+    # Restore the absent module key so later setenv-based tests keep using
+    # envs.__getattr__ rather than a stale value saved by setattr teardown.
+    monkeypatch.setitem(envs.__dict__, "VLLM_HYBRID_CACHE_SEGMENTED_REUSE", True)
     pool, blocks = _make_slru_pool(monkeypatch)
     block = blocks[0]
     manager = SimpleNamespace(
